@@ -1,0 +1,21 @@
+# Snippet for obs-streamelements-core/.github/workflows/build.yml.
+#
+# Add this step to the `deploy-signed-windows` job, after signing succeeds and next to the
+# CDN upload. Only the user-facing installers go to Monitor — not the plugin, installer,
+# uninstaller or probe binaries (CORE-440).
+
+- name: Upload signed installers to VirusTotal Monitor
+  if: env.is_workflow_automation != 'true' && github.ref == 'refs/heads/master'
+  uses: StreamElements/virustotal-monitor-action@v1
+  with:
+    # The action has no default and reads no environment variable — the key is always passed
+    # in. Point this at whatever your repo or org calls the secret.
+    api-key: ${{ secrets.VT_MONITOR_API_KEY }}
+    mode: upload
+    version: ${{ needs.version.outputs.version_encoded }}
+    path-prefix: /obs-streamelements/windows
+    files: |
+      ${{ github.workspace }}/signed/obs-streamelements-setup-${{ needs.version.outputs.version_encoded }}.exe
+      ${{ github.workspace }}/signed/obs-streamelements-setup-${{ needs.version.outputs.version_encoded }}-64bit.exe
+    # Upload failures are loud: a release that AV vendors never see is the problem this solves.
+    on-error: fail

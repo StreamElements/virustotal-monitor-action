@@ -1,0 +1,106 @@
+name: 'VirusTotal Monitor'
+description: 'Upload release artifacts to VirusTotal Monitor and prune old versions to stay under the storage quota'
+author: 'StreamElements'
+
+branding:
+  icon: 'shield'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: |
+      VirusTotal API key with Monitor privileges. Required, with no default: the action reads no
+      environment variable and assumes no secret name. Pass a secret, never a literal.
+    required: true
+  mode:
+    description: 'upload | prune | upload-and-prune'
+    required: false
+    default: 'upload'
+  files:
+    description: 'Newline-separated list of files or globs to upload. Required for upload modes.'
+    required: false
+    default: ''
+  version:
+    description: 'Release version used as the folder name under path-prefix, e.g. 20260729000746.'
+    required: false
+    default: ''
+  path-prefix:
+    description: 'Monitor folder that holds one sub-folder per version.'
+    required: false
+    default: '/obs-streamelements/windows'
+  remote-dir:
+    description: 'Explicit Monitor folder to upload into. Overrides path-prefix + version.'
+    required: false
+    default: ''
+  managed-prefixes:
+    description: 'Newline-separated prefixes the prune step is allowed to delete from. Defaults to path-prefix.'
+    required: false
+    default: ''
+  quota-bytes:
+    description: 'Monitor storage quota. Accepts bytes or human sizes (1GB, 1GiB). VirusTotal does not expose this via API.'
+    required: false
+    default: '1073741824'
+  high-watermark:
+    description: 'Usage fraction (0.8) or percentage (80) at which pruning starts.'
+    required: false
+    default: '0.8'
+  target-watermark:
+    description: 'Usage fraction (0.6) or percentage (60) to prune back down to. Must be below high-watermark.'
+    required: false
+    default: '0.6'
+  keep-versions:
+    description: 'Newest versions per prefix that are never deleted, regardless of channel.'
+    required: false
+    default: '10'
+  manifest-urls:
+    description: |
+      Newline-separated URLs of the live channel manifests (qa/beta/latest/stable).
+      Anything they reference is never deleted. Required to prune for real.
+    required: false
+    default: ''
+  pin-versions:
+    description: 'Newline-separated versions to protect from pruning in addition to the manifests.'
+    required: false
+    default: ''
+  usage-source:
+    description: |
+      walk = sum the live Monitor item tree (accurate, a few extra API calls).
+      statistics = use Monitor's daily storage snapshot (cheaper, up to a day stale).
+    required: false
+    default: 'walk'
+  dry-run:
+    description: 'Log what would be uploaded/deleted without changing anything.'
+    required: false
+    default: 'false'
+  on-error:
+    description: 'fail = mark the job failed (default, use for uploads). warn = log a warning and continue (use for prune).'
+    required: false
+    default: 'fail'
+  api-url:
+    description: 'VirusTotal API base URL. Override only for testing.'
+    required: false
+    default: 'https://www.virustotal.com/api/v3'
+
+outputs:
+  uploaded-count:
+    description: 'Number of files uploaded or overwritten.'
+  skipped-count:
+    description: 'Number of files already present in Monitor with identical content.'
+  uploaded-paths:
+    description: 'JSON array of Monitor paths that were uploaded.'
+  prune-triggered:
+    description: 'true when usage crossed the high watermark and pruning ran.'
+  deleted-count:
+    description: 'Number of version folders deleted (or that would be deleted in dry-run).'
+  deleted-versions:
+    description: 'JSON array of deleted version folder paths.'
+  freed-bytes:
+    description: 'Bytes reclaimed by the prune step.'
+  usage-bytes:
+    description: 'Monitor storage usage after pruning.'
+  usage-ratio:
+    description: 'Usage as a fraction of the quota after pruning.'
+
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
