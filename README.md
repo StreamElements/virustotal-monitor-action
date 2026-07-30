@@ -185,9 +185,26 @@ Verified against the current docs while implementing:
 ```bash
 npm ci
 npm run typecheck
-npm test
-npm run build   # regenerates dist/ — commit it, CI fails if it is stale
+npm test          # unit tests, no network
+npm run build     # regenerates dist/ — commit it, CI fails if it is stale
+npm run smoke     # runs the built bundle against a fake VirusTotal API
+npm run all       # all four, in order
 ```
 
 `dist/` is the bundle GitHub actually runs (`ncc`, node20 runtime). Source lives in `src/`,
 tests in `__tests__/`.
+
+**Run `npm run smoke` after any dependency change.** A green `npm run build` does not mean the
+bundle works: `ncc` can silently stub a dependency out and still exit 0, producing a bundle that
+passes typecheck, unit tests and the dist-freshness check but dies with `Cannot find module` on
+the runner. The smoke test executes `dist/index.js` for real and is the only check that catches
+this — it runs in CI directly after the build.
+
+Two constraints on dependencies, both recorded in `package.json` under `//overrides`:
+
+- **Stay on the CJS `@actions/core` 1.x line.** 3.x and `@actions/glob` 0.7 are ESM-only, which
+  is exactly what ncc stubs out.
+- **`undici` is force-resolved to `^6.28.0`** via `overrides`, including the copy
+  `@actions/http-client` pulls in — everything up to 6.26.0 carries the HTTP smuggling and
+  response-poisoning advisories. `brace-expansion` is overridden for the same reason in jest's
+  dependency chain. `npm audit` should report zero.

@@ -8,7 +8,8 @@
     "build": "ncc build src/main.ts -o dist --source-map --license licenses.txt",
     "typecheck": "tsc --noEmit",
     "test": "jest",
-    "all": "npm run typecheck && npm run test && npm run build"
+    "smoke": "node scripts/smoke.js",
+    "all": "npm run typecheck && npm run test && npm run build && npm run smoke"
   },
   "repository": {
     "type": "git",
@@ -24,7 +25,18 @@
   "dependencies": {
     "@actions/core": "^1.11.1",
     "@actions/glob": "^0.5.0",
-    "undici": "^5.28.5"
+    "undici": "^6.28.0"
+  },
+  "//overrides": [
+    "@actions/core 3.x and @actions/glob 0.7 are ESM-only; ncc bundles this action as CJS and",
+    "silently emits a bundle with @actions/core stubbed out. So we stay on the CJS 1.x line and",
+    "force its transitive undici up to a patched release instead -- @actions/http-client pins",
+    "undici ^5, and everything <=6.26.0 carries the smuggling/poisoning advisories.",
+    "brace-expansion: jest's minimatch chain pulls 1.x, and the only fixed release is 5.0.8+."
+  ],
+  "overrides": {
+    "brace-expansion": "^5.0.9",
+    "undici": "^6.28.0"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",

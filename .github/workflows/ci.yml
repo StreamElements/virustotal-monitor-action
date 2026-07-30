@@ -31,6 +31,11 @@ jobs:
       - name: Build
         run: npm run build
 
+      # A green build is not proof of a working bundle: ncc can silently stub a dependency out
+      # and still exit 0. This runs dist/index.js for real against a fake VirusTotal API.
+      - name: Smoke test the bundle
+        run: npm run smoke
+
       # The action runs straight from dist/, so a stale bundle ships stale behaviour.
       - name: Verify dist/ is up to date
         run: |
