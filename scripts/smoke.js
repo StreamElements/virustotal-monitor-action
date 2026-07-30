@@ -28,7 +28,15 @@ if (!fs.existsSync(ACTION)) {
 // Five 200-byte versions = 1000 B, matching the 1000 B quota used below so the watermarks land
 // on round numbers. Note there are deliberately no items for the intermediate folders: a real
 // Monitor root listing may not expose them, and usage must still be measured correctly.
-const state = { items: [], deleted: [], uploads: [], quotaReads: 0 }
+const state = {
+  items: [],
+  deleted: [],
+  uploads: [],
+  quotaReads: 0,
+  uploadUrlsIssued: 0,
+  rateLimitNextUpload: false,
+  baseUrl: ''
+}
 for (const [i, version] of VERSIONS.entries()) {
   state.items.push({
     id: `folder:${version}`,
@@ -89,11 +97,31 @@ const server = http.createServer((req, res) => {
     })
   }
 
-  if (req.method === 'POST' && url.pathname === '/api/v3/monitor/items') {
+  // Large files are told to POST here instead of /monitor/items. Each URL is single-use in the
+  // real API, so the token is recorded to prove a fresh one is fetched per attempt.
+  if (req.method === 'GET' && url.pathname === '/api/v3/monitor/items/upload_url') {
+    state.uploadUrlsIssued++
+    return send(200, { data: `${state.baseUrl}/upload/TOKEN-${state.uploadUrlsIssued}` })
+  }
+
+  if (req.method === 'POST' && (url.pathname === '/api/v3/monitor/items' || url.pathname.startsWith('/upload/'))) {
     let bytes = 0
     req.on('data', chunk => (bytes += chunk.length))
     req.on('end', () => {
-      state.uploads.push({ bytes, contentLength: Number(req.headers['content-length']) })
+      const attempt = {
+        bytes,
+        contentLength: Number(req.headers['content-length']),
+        url: url.pathname
+      }
+      if (state.rateLimitNextUpload) {
+        // Answer 429 once, the way VirusTotal does when the key is over its per-minute budget.
+        state.rateLimitNextUpload = false
+        attempt.rejected = true
+        state.uploads.push(attempt)
+        res.writeHead(429, { 'content-type': 'application/json', 'retry-after': '1' })
+        return res.end(JSON.stringify({ error: { code: 'QuotaExceededError', message: 'slow down' } }))
+      }
+      state.uploads.push(attempt)
       send(200, { data: { type: 'monitor_item', id: `uploaded-${state.uploads.length}` } })
     })
     return
@@ -150,8 +178,9 @@ const check = (label, condition, detail) => {
 }
 
 async function main(port) {
-  const api = `http://127.0.0.1:${port}/api/v3`
-  const manifestUrl = `http://127.0.0.1:${port}/manifest`
+  state.baseUrl = `http://127.0.0.1:${port}`
+  const api = `${state.baseUrl}/api/v3`
+  const manifestUrl = `${state.baseUrl}/manifest`
   const artifact = path.join(os.tmpdir(), 'obs-streamelements-setup-20260729000746.exe')
   fs.writeFileSync(artifact, Buffer.alloc(4096, 7))
   // Rate limiting off for the functional checks: the 4/min default is correct for production but
@@ -238,6 +267,48 @@ async function main(port) {
   run = await runAction({ ...common, mode: 'prune', 'quota-bytes': '1000', 'on-error': 'warn' })
   check('exit 0', run.exitCode === 0, run.exitCode)
   check('warned instead of failing', /::warning::/.test(run.stdout), run.stdout.slice(0, 300))
+
+  console.log('--- upload survives an HTTP 429 ---')
+  state.uploads = []
+  state.rateLimitNextUpload = true
+  run = await runAction({ ...common, mode: 'upload', files: artifact, version: '20260801000001' })
+  check('exit 0 after the retry', run.exitCode === 0, `${run.exitCode}: ${run.stdout.slice(0, 400)}`)
+  check('uploaded once the limit cleared', run.outputs['uploaded-count'] === '1', run.outputs['uploaded-count'])
+  check(
+    'took two attempts, the first rejected',
+    state.uploads.length === 2 && state.uploads[0].rejected === true && !state.uploads[1].rejected,
+    JSON.stringify(state.uploads)
+  )
+  check(
+    'resent the whole body rather than a consumed stream',
+    state.uploads[1] && state.uploads[1].bytes === state.uploads[1].contentLength,
+    JSON.stringify(state.uploads[1])
+  )
+  check('said it was rate limited', /rate-limited the upload of/.test(run.stdout), run.stdout.slice(0, 500))
+
+  console.log('--- a large file retries against a fresh upload URL ---')
+  const bigFile = path.join(os.tmpdir(), 'obs-streamelements-setup-big.exe')
+  fs.writeFileSync(bigFile, '')
+  fs.truncateSync(bigFile, 33 * 1024 * 1024) // over VirusTotal's 32 MB direct-upload limit
+  state.uploads = []
+  state.uploadUrlsIssued = 0
+  state.rateLimitNextUpload = true
+  run = await runAction({ ...common, mode: 'upload', files: bigFile, version: '20260801000002' })
+  check('exit 0 after the retry', run.exitCode === 0, `${run.exitCode}: ${run.stdout.slice(0, 400)}`)
+  check('issued a separate upload URL per attempt', state.uploadUrlsIssued === 2, state.uploadUrlsIssued)
+  check(
+    'the retry used the second URL, not the spent one',
+    state.uploads.length === 2 &&
+      state.uploads[0].url === '/upload/TOKEN-1' &&
+      state.uploads[1].url === '/upload/TOKEN-2',
+    JSON.stringify(state.uploads.map(u => u.url))
+  )
+  check(
+    'streamed all 33 MB on the retry',
+    state.uploads[1] && state.uploads[1].bytes === state.uploads[1].contentLength,
+    JSON.stringify(state.uploads[1])
+  )
+  fs.unlinkSync(bigFile)
 
   console.log('--- rate limiting: seeds from the API and reports request count ---')
   state.quotaReads = 0

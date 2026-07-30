@@ -141,6 +141,26 @@ action reads the key's current usage from `/users/{key}/overall_quotas` and fold
 what makes those budgets mean anything across runs. It costs one request, and if the key cannot
 read its own quotas the step warns and paces this run only.
 
+### When a 429 arrives anyway
+
+Pacing is a prediction, and a 429 means it was wrong — the key's real limits are tighter than the
+configured ones. Three things then happen:
+
+1. **The wait matches the window.** Exponential backoff from a one-second base is the wrong shape
+   for a rate limit: `1s, 2s, 4s, 8s` exhausts four retries in fifteen seconds without the
+   smallest VirusTotal window having elapsed. A 429 instead waits what `Retry-After` asks for, or
+   a full minute if the header is absent. Other retryable errors keep the exponential curve.
+2. **The rest of the run slows down.** The 429 is fed back into the limiter, which holds every
+   later call for the same period rather than letting them march into the same wall.
+3. **Uploads are re-sent correctly.** The multipart body is rebuilt per attempt, so a retry sends
+   the whole file rather than an already-consumed stream. For files ≥ 32 MB, each attempt fetches
+   its **own** upload URL — those are single-use, so retrying against the previous one fails on a
+   dead URL rather than on the upload.
+
+A 429 that survives all retries fails the step with the VirusTotal error code intact. For a
+release that matters: `on-error: fail` on the upload step means a rate-limited release is loud
+rather than silently missing from Monitor.
+
 **Two ways a run can stop on rate limits, both loud rather than hanging:**
 
 - The wait needed exceeds `rate-limit-max-wait` (default 300s) — e.g. the daily budget is full and

@@ -64,6 +64,8 @@ export class RateLimiter {
   /** Timestamps of requests made by this run, oldest first. */
   private history: number[] = []
   private waitedMs = 0
+  /** Set when VirusTotal answers 429; no call goes out before this moment. */
+  private penaltyUntil = 0
 
   constructor(config: RateLimitConfig, deps: RateLimiterDeps = {}) {
     const windows: Window[] = [
@@ -86,11 +88,35 @@ export class RateLimiter {
     }
   }
 
+  /**
+   * Records that VirusTotal rejected a call as over-quota, holding every later call until
+   * `untilMs`. A 429 proves the configured limits are looser than the key's real ones, so the
+   * rest of the run should not keep charging at the same rate.
+   */
+  penalize(waitMs: number): void {
+    // A duration rather than a deadline, so the caller never has to share our clock.
+    this.penaltyUntil = Math.max(this.penaltyUntil, this.now() + waitMs)
+  }
+
   /** Blocks until a request may be made, then records it. */
   async acquire(): Promise<void> {
     for (;;) {
       const now = this.now()
       this.forget(now)
+
+      if (now < this.penaltyUntil) {
+        const waitMs = this.penaltyUntil - now
+        if (waitMs > this.maxWaitMs) {
+          throw new RateLimitExceededError(
+            `VirusTotal returned 429 and asked to wait ${Math.round(waitMs / 1000)}s, beyond the ` +
+              `${Math.round(this.maxWaitMs / 1000)}s cap set by rate-limit-max-wait.`
+          )
+        }
+        this.logger.debug(`Holding ${Math.round(waitMs / 1000)}s after a 429 from VirusTotal`)
+        this.waitedMs += waitMs
+        await this.sleep(waitMs)
+        continue
+      }
 
       const blocked = this.windows.filter(window => this.used(window, now) >= window.limit)
       if (blocked.length === 0) {

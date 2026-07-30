@@ -149,6 +149,62 @@ describe('the wait cap', () => {
   })
 })
 
+describe('the 429 penalty', () => {
+  it('holds every later call for the penalty, even with headroom left', async () => {
+    const time = clock()
+    const limiter = new RateLimiter(limits({ perMinute: 100 }), time)
+
+    await limiter.acquire()
+    limiter.penalize(45_000)
+    await limiter.acquire()
+
+    expect(time.sleeps).toEqual([45_000])
+  })
+
+  it('keeps the longest penalty rather than letting a later one shorten it', async () => {
+    const time = clock()
+    const limiter = new RateLimiter(limits({ perMinute: 100 }), time)
+
+    limiter.penalize(90_000)
+    limiter.penalize(10_000)
+    await limiter.acquire()
+
+    expect(time.sleeps).toEqual([90_000])
+  })
+
+  it('serves calls normally again once the penalty has passed', async () => {
+    const time = clock()
+    const limiter = new RateLimiter(limits({ perMinute: 100 }), time)
+
+    limiter.penalize(30_000)
+    await limiter.acquire() // waits out the penalty
+    await limiter.acquire() // free again
+
+    expect(time.sleeps).toEqual([30_000])
+  })
+
+  it('refuses a penalty longer than the wait cap instead of stalling the job', async () => {
+    const time = clock()
+    const limiter = new RateLimiter(limits({ perMinute: 100, maxWaitMs: 60_000 }), time)
+
+    limiter.penalize(10 * MINUTE_MS)
+
+    await expect(limiter.acquire()).rejects.toThrow(
+      /VirusTotal returned 429 and asked to wait 600s, beyond the 60s cap/
+    )
+  })
+
+  it('counts penalty time as time waited', async () => {
+    const time = clock()
+    const limiter = new RateLimiter(limits({ perMinute: 100 }), time)
+
+    limiter.penalize(20_000)
+    await limiter.acquire()
+
+    expect(limiter.stats().waitedMs).toBe(20_000)
+  })
+})
+
 describe('stats', () => {
   it('reports requests made, time waited and headroom left', async () => {
     const time = clock()

@@ -195,6 +195,96 @@ describe('uploadFile', () => {
   })
 })
 
+describe('uploads that get rate limited', () => {
+  let localPath: string
+
+  beforeAll(async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'vt-429-'))
+    localPath = join(dir, 'setup.exe')
+    await writeFile(localPath, 'installer')
+  })
+
+  function uploader(responses: Parameters<typeof fakeTransport>[0], slept: number[] = []) {
+    const transport = fakeTransport(responses)
+    const client = new MonitorClient({
+      apiKey: 'test-key',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: transport.requestFn as never,
+      sleepFn: async ms => {
+        slept.push(ms)
+      }
+    })
+    return { ...transport, client, slept }
+  }
+
+  it('re-sends a small upload after waiting out the 429', async () => {
+    const { calls, client, slept } = uploader([
+      { statusCode: 429, headers: { 'retry-after': '20' }, payload: { error: { message: 'slow down' } } },
+      { statusCode: 200, payload: { data: { id: 'after-retry' } } }
+    ])
+
+    const id = await client.uploadFile({ localPath, remotePath: '/a/setup.exe', size: 9 })
+
+    expect(id).toBe('after-retry')
+    expect(slept).toEqual([20_000])
+    expect(calls).toHaveLength(2)
+    // The body is rebuilt for the retry rather than being a consumed stream.
+    expect(calls[1].body).toContain('installer')
+  })
+
+  it('fetches a fresh upload URL for every large-file attempt', async () => {
+    // Upload URLs are single-use, so retrying against the first one would fail on the URL.
+    const { calls, client } = uploader([
+      { statusCode: 200, payload: { data: 'https://vt.test/_ah/upload/FIRST/' } },
+      { statusCode: 429, payload: { error: { message: 'slow down' } } },
+      { statusCode: 200, payload: { data: 'https://vt.test/_ah/upload/SECOND/' } },
+      { statusCode: 200, payload: { data: { id: 'big-id' } } }
+    ])
+
+    const id = await client.uploadFile({
+      localPath,
+      remotePath: '/a/big.exe',
+      size: DIRECT_UPLOAD_LIMIT_BYTES
+    })
+
+    expect(id).toBe('big-id')
+    expect(calls.map(call => call.url)).toEqual([
+      'https://vt.test/api/v3/monitor/items/upload_url',
+      'https://vt.test/_ah/upload/FIRST/',
+      'https://vt.test/api/v3/monitor/items/upload_url',
+      'https://vt.test/_ah/upload/SECOND/'
+    ])
+  })
+
+  it('leaves the upload URL alone when the API itself is plain http', async () => {
+    // Only reachable in tests; a real api-url is https, where the upgrade above still applies.
+    const transport = fakeTransport([
+      { statusCode: 200, payload: { data: 'http://127.0.0.1:8080/_ah/upload/TOKEN/' } },
+      { statusCode: 200, payload: { data: { id: 'local-id' } } }
+    ])
+    const local = new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'http://127.0.0.1:8080/api/v3',
+      requestFn: transport.requestFn as never,
+      sleepFn: async () => undefined
+    })
+
+    await local.uploadFile({ localPath, remotePath: '/a/big.exe', size: DIRECT_UPLOAD_LIMIT_BYTES })
+
+    expect(transport.calls[1].url).toBe('http://127.0.0.1:8080/_ah/upload/TOKEN/')
+  })
+
+  it('gives up with the rate-limit error after exhausting retries', async () => {
+    const { client, slept } = uploader([{ statusCode: 429, payload: { error: { code: 'QuotaExceededError' } } }])
+
+    await expect(client.uploadFile({ localPath, remotePath: '/a/setup.exe', size: 9 })).rejects.toThrow(
+      /HTTP 429.*QuotaExceededError/
+    )
+    // Four retries, each waiting a full window rather than a doubling millisecond delay.
+    expect(slept).toEqual([60_000, 60_000, 60_000, 60_000])
+  })
+})
+
 describe('deleteItem', () => {
   it('url-encodes the base64 item id', async () => {
     const { calls, requestFn } = fakeTransport([{ statusCode: 200, payload: {} }])
@@ -266,7 +356,7 @@ describe('rate limiting', () => {
     expect(slept).toEqual([42_000])
   })
 
-  it('falls back to exponential backoff when no Retry-After is sent', async () => {
+  it('waits a full window after a 429 with no Retry-After, not a 1s exponential step', async () => {
     const slept: number[] = []
     const { requestFn } = fakeTransport([
       { statusCode: 429, payload: { error: { message: 'slow down' } } },
@@ -284,7 +374,49 @@ describe('rate limiting', () => {
     })
     await paced.listFolder('/a')
 
-    expect(slept).toEqual([1000])
+    // The smallest VirusTotal window is a minute, so anything shorter cannot clear a 429.
+    expect(slept).toEqual([60_000])
+  })
+
+  it('still uses exponential backoff for retryable errors that are not rate limits', async () => {
+    const slept: number[] = []
+    const { requestFn } = fakeTransport([
+      { statusCode: 503, raw: 'gateway' },
+      { statusCode: 503, raw: 'gateway' },
+      { statusCode: 200, payload: { data: [] } }
+    ])
+
+    const paced = new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      sleepFn: async ms => {
+        slept.push(ms)
+      },
+      retryBaseMs: 1000
+    })
+    await paced.listFolder('/a')
+
+    expect(slept).toEqual([1000, 2000])
+  })
+
+  it('tells the limiter to hold everything else back after a 429', async () => {
+    const penalize = jest.fn()
+    const { requestFn } = fakeTransport([
+      { statusCode: 429, headers: { 'retry-after': '90' }, payload: { error: { message: 'slow down' } } },
+      { statusCode: 200, payload: { data: [] } }
+    ])
+
+    const paced = new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      sleepFn: async () => undefined,
+      rateLimiter: { acquire: jest.fn().mockResolvedValue(undefined), penalize }
+    })
+    await paced.listFolder('/a')
+
+    expect(penalize).toHaveBeenCalledWith(90_000)
   })
 })
 

@@ -39,9 +39,11 @@ export interface MonitorClientOptions {
   apiUrl?: string
   maxRetries?: number
   retryBaseMs?: number
+  /** Wait after a 429 that carries no Retry-After. Defaults to one full minute window. */
+  rateLimitBackoffMs?: number
   logger?: Logger
   /** Paces calls to stay inside VirusTotal's quotas. Omit to send without pacing. */
-  rateLimiter?: Pick<RateLimiter, 'acquire'>
+  rateLimiter?: Pick<RateLimiter, 'acquire'> & Partial<Pick<RateLimiter, 'penalize'>>
   /** Seam for tests; defaults to undici's `request`. */
   requestFn?: RequestFn
   sleepFn?: (ms: number) => Promise<void>
@@ -87,13 +89,15 @@ export class MonitorClient {
   private readonly logger: Logger
   private readonly requestFn: RequestFn
   private readonly sleepFn: (ms: number) => Promise<void>
-  private readonly rateLimiter?: Pick<RateLimiter, 'acquire'>
+  private readonly rateLimiter?: Pick<RateLimiter, 'acquire'> & Partial<Pick<RateLimiter, 'penalize'>>
+  private readonly rateLimitBackoffMs: number
 
   constructor(options: MonitorClientOptions) {
     this.apiKey = options.apiKey
     this.apiUrl = (options.apiUrl ?? DEFAULT_API_URL).replace(/\/+$/, '')
     this.maxRetries = options.maxRetries ?? 4
     this.retryBaseMs = options.retryBaseMs ?? 1000
+    this.rateLimitBackoffMs = options.rateLimitBackoffMs ?? 60_000
     this.logger = options.logger ?? silentLogger
     this.requestFn = options.requestFn ?? request
     this.sleepFn = options.sleepFn ?? defaultSleep
@@ -197,7 +201,11 @@ export class MonitorClient {
       throw new MonitorApiError('VirusTotal returned an empty upload URL', 0)
     }
     // The documented sample URL is http://; never send an API key or binary in the clear.
-    return payload.data.replace(/^http:\/\//i, 'https://')
+    // The exception is an api-url that is itself plain http, which only happens when pointing
+    // at a local server in tests — forcing https there would make the path untestable.
+    return this.apiUrl.startsWith('https://')
+      ? payload.data.replace(/^http:\/\//i, 'https://')
+      : payload.data
   }
 
   /**
@@ -226,19 +234,22 @@ export class MonitorClient {
       createStream: () => createReadStream(params.localPath)
     })
 
-    const url =
-      params.size >= DIRECT_UPLOAD_LIMIT_BYTES ? await this.getUploadUrl() : `${this.apiUrl}/monitor/items`
+    // Upload URLs handed out for large files are single-use and temporary, so every attempt
+    // needs its own — retrying against the previous one fails on a URL, not on the upload.
+    const large = params.size >= DIRECT_UPLOAD_LIMIT_BYTES
 
     const payload = await this.send<{ data?: { id?: string } }>({
       method: 'POST',
-      url,
+      url: `${this.apiUrl}/monitor/items`,
+      resolveUrl: large ? () => this.getUploadUrl() : undefined,
       headers: {
         'content-type': body.contentType,
         'content-length': String(body.contentLength)
       },
       createBody: () => body.createStream(),
       // Large uploads keep the socket busy long before the response headers arrive.
-      headersTimeoutMs: 15 * 60 * 1000
+      headersTimeoutMs: 15 * 60 * 1000,
+      what: `upload of ${remotePath}`
     })
 
     const id = payload.data?.id
@@ -255,26 +266,32 @@ export class MonitorClient {
   private async send<T>(options: {
     method: 'GET' | 'DELETE' | 'POST'
     url: string
+    /** Produces a fresh URL per attempt, for single-use endpoints like the large-file upload URL. */
+    resolveUrl?: () => Promise<string>
     headers?: Record<string, string>
     createBody?: () => Readable
     headersTimeoutMs?: number
+    /** Human description used in rate-limit messages, e.g. "upload of /a/setup.exe". */
+    what?: string
   }): Promise<T> {
     let lastError: Error | undefined
-    let retryAfterMs: number | undefined
+    let retryDelayMs: number | undefined
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       if (attempt > 0) {
-        const delay = retryAfterMs ?? this.retryBaseMs * 2 ** (attempt - 1)
+        const delay = retryDelayMs ?? this.retryBaseMs * 2 ** (attempt - 1)
         this.logger.debug(`Retry ${attempt}/${this.maxRetries} for ${options.method} ${options.url} in ${delay}ms`)
         await this.sleepFn(delay)
       }
-      retryAfterMs = undefined
+      retryDelayMs = undefined
 
       // A retry costs quota just like the first attempt, so it is paced too.
       if (this.rateLimiter) await this.rateLimiter.acquire()
 
+      const url = options.resolveUrl ? await options.resolveUrl() : options.url
+
       try {
-        const response = await this.requestFn(options.url, {
+        const response = await this.requestFn(url, {
           method: options.method,
           headers: {
             'x-apikey': this.apiKey,
@@ -292,13 +309,27 @@ export class MonitorClient {
           return (text.length > 0 ? JSON.parse(text) : {}) as T
         }
 
-        const error = toApiError(response.statusCode, text, options.method, options.url)
+        const error = toApiError(response.statusCode, text, options.method, url)
         if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === this.maxRetries) {
           throw error
         }
-        // When VirusTotal says how long to wait, believe it over our own backoff curve.
-        retryAfterMs = parseRetryAfter(response.headers)
-        this.logger.warning(`${error.message} — retrying`)
+
+        if (response.statusCode === 429) {
+          // Our pacing was too optimistic for this key. Exponential backoff from a 1s base is
+          // the wrong shape here: the smallest VirusTotal window is a minute, so 1s/2s/4s/8s
+          // just burns the retry budget — and for a large upload, re-sends the whole file each
+          // time. Wait what VirusTotal asks for, or a full window if it does not say.
+          retryDelayMs = parseRetryAfter(response.headers) ?? this.rateLimitBackoffMs
+          this.rateLimiter?.penalize?.(retryDelayMs)
+          this.logger.warning(
+            `VirusTotal rate-limited the ${options.what ?? `${options.method} request`} (HTTP 429). ` +
+              `Waiting ${Math.round(retryDelayMs / 1000)}s before attempt ${attempt + 2} of ${this.maxRetries + 1}. ` +
+              'If this recurs, lower rate-limit-per-minute to match the key.'
+          )
+        } else {
+          retryDelayMs = parseRetryAfter(response.headers)
+          this.logger.warning(`${error.message} — retrying`)
+        }
         lastError = error
       } catch (caught) {
         if (caught instanceof MonitorApiError) {
@@ -309,7 +340,7 @@ export class MonitorClient {
         // Network-level failure (reset socket, DNS, timeout): worth another attempt.
         const error = caught instanceof Error ? caught : new Error(String(caught))
         if (attempt === this.maxRetries) throw error
-        this.logger.warning(`${options.method} ${options.url} failed: ${error.message} — retrying`)
+        this.logger.warning(`${options.method} ${url} failed: ${error.message} — retrying`)
         lastError = error
       }
     }

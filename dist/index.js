@@ -37935,6 +37935,8 @@ class RateLimiter {
         /** Timestamps of requests made by this run, oldest first. */
         this.history = [];
         this.waitedMs = 0;
+        /** Set when VirusTotal answers 429; no call goes out before this moment. */
+        this.penaltyUntil = 0;
         const windows = [
             { name: 'minute', spanMs: exports.MINUTE_MS, limit: config.perMinute, spent: 0 },
             { name: 'day', spanMs: exports.DAY_MS, limit: config.perDay, spent: 0 },
@@ -37954,11 +37956,31 @@ class RateLimiter {
                 window.spent = value;
         }
     }
+    /**
+     * Records that VirusTotal rejected a call as over-quota, holding every later call until
+     * `untilMs`. A 429 proves the configured limits are looser than the key's real ones, so the
+     * rest of the run should not keep charging at the same rate.
+     */
+    penalize(waitMs) {
+        // A duration rather than a deadline, so the caller never has to share our clock.
+        this.penaltyUntil = Math.max(this.penaltyUntil, this.now() + waitMs);
+    }
     /** Blocks until a request may be made, then records it. */
     async acquire() {
         for (;;) {
             const now = this.now();
             this.forget(now);
+            if (now < this.penaltyUntil) {
+                const waitMs = this.penaltyUntil - now;
+                if (waitMs > this.maxWaitMs) {
+                    throw new RateLimitExceededError(`VirusTotal returned 429 and asked to wait ${Math.round(waitMs / 1000)}s, beyond the ` +
+                        `${Math.round(this.maxWaitMs / 1000)}s cap set by rate-limit-max-wait.`);
+                }
+                this.logger.debug(`Holding ${Math.round(waitMs / 1000)}s after a 429 from VirusTotal`);
+                this.waitedMs += waitMs;
+                await this.sleep(waitMs);
+                continue;
+            }
             const blocked = this.windows.filter(window => this.used(window, now) >= window.limit);
             if (blocked.length === 0) {
                 this.history.push(now);
@@ -38256,6 +38278,7 @@ class MonitorClient {
         this.apiUrl = (options.apiUrl ?? exports.DEFAULT_API_URL).replace(/\/+$/, '');
         this.maxRetries = options.maxRetries ?? 4;
         this.retryBaseMs = options.retryBaseMs ?? 1000;
+        this.rateLimitBackoffMs = options.rateLimitBackoffMs ?? 60_000;
         this.logger = options.logger ?? logging_1.silentLogger;
         this.requestFn = options.requestFn ?? undici_1.request;
         this.sleepFn = options.sleepFn ?? defaultSleep;
@@ -38340,7 +38363,11 @@ class MonitorClient {
             throw new MonitorApiError('VirusTotal returned an empty upload URL', 0);
         }
         // The documented sample URL is http://; never send an API key or binary in the clear.
-        return payload.data.replace(/^http:\/\//i, 'https://');
+        // The exception is an api-url that is itself plain http, which only happens when pointing
+        // at a local server in tests — forcing https there would make the path untestable.
+        return this.apiUrl.startsWith('https://')
+            ? payload.data.replace(/^http:\/\//i, 'https://')
+            : payload.data;
     }
     /**
      * Uploads a file to `remotePath`. Passing `existingItemId` overwrites that item in place,
@@ -38360,17 +38387,21 @@ class MonitorClient {
             size: params.size,
             createStream: () => (0, node_fs_1.createReadStream)(params.localPath)
         });
-        const url = params.size >= exports.DIRECT_UPLOAD_LIMIT_BYTES ? await this.getUploadUrl() : `${this.apiUrl}/monitor/items`;
+        // Upload URLs handed out for large files are single-use and temporary, so every attempt
+        // needs its own — retrying against the previous one fails on a URL, not on the upload.
+        const large = params.size >= exports.DIRECT_UPLOAD_LIMIT_BYTES;
         const payload = await this.send({
             method: 'POST',
-            url,
+            url: `${this.apiUrl}/monitor/items`,
+            resolveUrl: large ? () => this.getUploadUrl() : undefined,
             headers: {
                 'content-type': body.contentType,
                 'content-length': String(body.contentLength)
             },
             createBody: () => body.createStream(),
             // Large uploads keep the socket busy long before the response headers arrive.
-            headersTimeoutMs: 15 * 60 * 1000
+            headersTimeoutMs: 15 * 60 * 1000,
+            what: `upload of ${remotePath}`
         });
         const id = payload.data?.id;
         if (!id) {
@@ -38383,19 +38414,20 @@ class MonitorClient {
     }
     async send(options) {
         let lastError;
-        let retryAfterMs;
+        let retryDelayMs;
         for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
             if (attempt > 0) {
-                const delay = retryAfterMs ?? this.retryBaseMs * 2 ** (attempt - 1);
+                const delay = retryDelayMs ?? this.retryBaseMs * 2 ** (attempt - 1);
                 this.logger.debug(`Retry ${attempt}/${this.maxRetries} for ${options.method} ${options.url} in ${delay}ms`);
                 await this.sleepFn(delay);
             }
-            retryAfterMs = undefined;
+            retryDelayMs = undefined;
             // A retry costs quota just like the first attempt, so it is paced too.
             if (this.rateLimiter)
                 await this.rateLimiter.acquire();
+            const url = options.resolveUrl ? await options.resolveUrl() : options.url;
             try {
-                const response = await this.requestFn(options.url, {
+                const response = await this.requestFn(url, {
                     method: options.method,
                     headers: {
                         'x-apikey': this.apiKey,
@@ -38411,13 +38443,25 @@ class MonitorClient {
                 if (response.statusCode >= 200 && response.statusCode < 300) {
                     return (text.length > 0 ? JSON.parse(text) : {});
                 }
-                const error = toApiError(response.statusCode, text, options.method, options.url);
+                const error = toApiError(response.statusCode, text, options.method, url);
                 if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === this.maxRetries) {
                     throw error;
                 }
-                // When VirusTotal says how long to wait, believe it over our own backoff curve.
-                retryAfterMs = parseRetryAfter(response.headers);
-                this.logger.warning(`${error.message} — retrying`);
+                if (response.statusCode === 429) {
+                    // Our pacing was too optimistic for this key. Exponential backoff from a 1s base is
+                    // the wrong shape here: the smallest VirusTotal window is a minute, so 1s/2s/4s/8s
+                    // just burns the retry budget — and for a large upload, re-sends the whole file each
+                    // time. Wait what VirusTotal asks for, or a full window if it does not say.
+                    retryDelayMs = parseRetryAfter(response.headers) ?? this.rateLimitBackoffMs;
+                    this.rateLimiter?.penalize?.(retryDelayMs);
+                    this.logger.warning(`VirusTotal rate-limited the ${options.what ?? `${options.method} request`} (HTTP 429). ` +
+                        `Waiting ${Math.round(retryDelayMs / 1000)}s before attempt ${attempt + 2} of ${this.maxRetries + 1}. ` +
+                        'If this recurs, lower rate-limit-per-minute to match the key.');
+                }
+                else {
+                    retryDelayMs = parseRetryAfter(response.headers);
+                    this.logger.warning(`${error.message} — retrying`);
+                }
                 lastError = error;
             }
             catch (caught) {
@@ -38431,7 +38475,7 @@ class MonitorClient {
                 const error = caught instanceof Error ? caught : new Error(String(caught));
                 if (attempt === this.maxRetries)
                     throw error;
-                this.logger.warning(`${options.method} ${options.url} failed: ${error.message} — retrying`);
+                this.logger.warning(`${options.method} ${url} failed: ${error.message} — retrying`);
                 lastError = error;
             }
         }
