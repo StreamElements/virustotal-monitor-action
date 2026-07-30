@@ -228,6 +228,35 @@ Verified against the current docs while implementing:
   and it is a daily snapshot. **The API does not expose the storage limit**, which is why
   `quota-bytes` is an input (1 GiB on our account).
 
+## Releasing
+
+Workflows reference `@v1`, which is a **moving tag** pointing at the newest 1.x release. Cutting
+a release means creating the version tag *and* moving `v1` — forget the second step and every
+consumer stays on the old code while the release notes claim otherwise.
+
+```bash
+npm run all                      # typecheck, test, build, smoke — dist/ must be committed
+git tag -a v1.2.3 -m "v1.2.3 — what changed"
+git tag -fa v1 -m "Moving tag: latest v1.x release (currently v1.2.3)"
+git push origin v1.2.3
+git push --force origin v1       # the moving tag has to be force-pushed
+gh release create v1.2.3 --title "v1.2.3 — …" --latest --notes-file notes.md
+```
+
+Breaking changes to inputs or behaviour get a new major (`v2` plus a new moving tag), leaving
+`v1` where it is so existing workflows keep working.
+
+Because the repository is **internal**, other repositories in the organization can only use this
+action if its Actions access policy allows it. That is already set, and reads back as:
+
+```bash
+gh api repos/StreamElements/virustotal-monitor-action/actions/permissions/access
+# {"access_level":"organization"}
+```
+
+If a consuming workflow ever fails to resolve the action, check that first — the symptom is a
+"repository not found" style error that looks like a bad tag but is not.
+
 ## Development
 
 ```bash
