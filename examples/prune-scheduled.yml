@@ -60,6 +60,11 @@ jobs:
             https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/beta/obs-streamelements.manifest
             https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/latest/obs-streamelements.manifest
             https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/stable/obs-streamelements.manifest
+          # Public-API allowances by default. A prune walks the tree and deletes per version, so
+          # at 4/minute expect a few minutes of wall clock; raise these if the key allows more.
+          rate-limit-per-minute: ${{ vars.VT_MONITOR_RATE_PER_MINUTE || '4' }}
+          rate-limit-per-day: ${{ vars.VT_MONITOR_RATE_PER_DAY || '500' }}
+          rate-limit-per-month: ${{ vars.VT_MONITOR_RATE_PER_MONTH || '15500' }}
           # Scheduled runs default to enforcing; manual runs default to previewing.
           dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run || 'false' }}
           # Storage housekeeping must never take a release down with it.

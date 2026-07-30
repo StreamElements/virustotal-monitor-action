@@ -4,6 +4,7 @@ import { request } from 'undici'
 
 import { Logger, silentLogger } from './logging'
 import { buildMultipart } from './multipart'
+import { RateLimiter } from './rate-limiter'
 import { asFolderPath, normalizePath } from './paths'
 import { MonitorItem, MonitorStatistics } from './types'
 
@@ -39,6 +40,8 @@ export interface MonitorClientOptions {
   maxRetries?: number
   retryBaseMs?: number
   logger?: Logger
+  /** Paces calls to stay inside VirusTotal's quotas. Omit to send without pacing. */
+  rateLimiter?: Pick<RateLimiter, 'acquire'>
   /** Seam for tests; defaults to undici's `request`. */
   requestFn?: RequestFn
   sleepFn?: (ms: number) => Promise<void>
@@ -84,6 +87,7 @@ export class MonitorClient {
   private readonly logger: Logger
   private readonly requestFn: RequestFn
   private readonly sleepFn: (ms: number) => Promise<void>
+  private readonly rateLimiter?: Pick<RateLimiter, 'acquire'>
 
   constructor(options: MonitorClientOptions) {
     this.apiKey = options.apiKey
@@ -93,6 +97,24 @@ export class MonitorClient {
     this.logger = options.logger ?? silentLogger
     this.requestFn = options.requestFn ?? request
     this.sleepFn = options.sleepFn ?? defaultSleep
+    this.rateLimiter = options.rateLimiter
+  }
+
+  /**
+   * Usage VirusTotal reports for this key. Used to seed the rate limiter so the daily and
+   * monthly budgets account for requests made outside this run.
+   */
+  async getApiQuotas(): Promise<{ dailyUsed?: number; monthlyUsed?: number; dailyAllowed?: number }> {
+    type Quota = { used?: number; allowed?: number }
+    const payload = await this.json<{
+      data?: { api_requests_daily?: Quota; api_requests_monthly?: Quota }
+    }>('GET', `/users/${encodeURIComponent(this.apiKey)}/overall_quotas`)
+
+    return {
+      dailyUsed: payload.data?.api_requests_daily?.used,
+      dailyAllowed: payload.data?.api_requests_daily?.allowed,
+      monthlyUsed: payload.data?.api_requests_monthly?.used
+    }
   }
 
   /** Direct children of a Monitor folder (files and sub-folders). */
@@ -238,13 +260,18 @@ export class MonitorClient {
     headersTimeoutMs?: number
   }): Promise<T> {
     let lastError: Error | undefined
+    let retryAfterMs: number | undefined
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       if (attempt > 0) {
-        const delay = this.retryBaseMs * 2 ** (attempt - 1)
+        const delay = retryAfterMs ?? this.retryBaseMs * 2 ** (attempt - 1)
         this.logger.debug(`Retry ${attempt}/${this.maxRetries} for ${options.method} ${options.url} in ${delay}ms`)
         await this.sleepFn(delay)
       }
+      retryAfterMs = undefined
+
+      // A retry costs quota just like the first attempt, so it is paced too.
+      if (this.rateLimiter) await this.rateLimiter.acquire()
 
       try {
         const response = await this.requestFn(options.url, {
@@ -269,6 +296,8 @@ export class MonitorClient {
         if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === this.maxRetries) {
           throw error
         }
+        // When VirusTotal says how long to wait, believe it over our own backoff curve.
+        retryAfterMs = parseRetryAfter(response.headers)
         this.logger.warning(`${error.message} — retrying`)
         lastError = error
       } catch (caught) {
@@ -287,6 +316,21 @@ export class MonitorClient {
 
     throw lastError ?? new Error(`${options.method} ${options.url} failed`)
   }
+}
+
+/** `Retry-After` is either a delay in seconds or an HTTP date. Capped so a bad value can't stall a job. */
+export function parseRetryAfter(
+  headers: Record<string, string | string[] | undefined> | undefined,
+  now: number = Date.now()
+): number | undefined {
+  const raw = headers?.['retry-after']
+  const value = Array.isArray(raw) ? raw[0] : raw
+  if (!value) return undefined
+
+  const seconds = Number(value)
+  const ms = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - now
+  if (!Number.isFinite(ms) || ms <= 0) return undefined
+  return Math.min(ms, 5 * 60_000)
 }
 
 function toApiError(statusCode: number, text: string, method: string, url: string): MonitorApiError {

@@ -28,7 +28,7 @@ if (!fs.existsSync(ACTION)) {
 // Five 200-byte versions = 1000 B, matching the 1000 B quota used below so the watermarks land
 // on round numbers. Note there are deliberately no items for the intermediate folders: a real
 // Monitor root listing may not expose them, and usage must still be measured correctly.
-const state = { items: [], deleted: [], uploads: [] }
+const state = { items: [], deleted: [], uploads: [], quotaReads: 0 }
 for (const [i, version] of VERSIONS.entries()) {
   state.items.push({
     id: `folder:${version}`,
@@ -65,6 +65,16 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/manifest') {
     res.writeHead(200, { 'content-type': 'text/plain' })
     return res.end(MANIFEST)
+  }
+
+  if (req.method === 'GET' && /^\/api\/v3\/users\/[^/]+\/overall_quotas$/.test(url.pathname)) {
+    state.quotaReads++
+    return send(200, {
+      data: {
+        api_requests_daily: { allowed: 500, used: 137 },
+        api_requests_monthly: { allowed: 15500, used: 4021 }
+      }
+    })
   }
 
   if (req.method === 'GET' && url.pathname === '/api/v3/monitor/items') {
@@ -144,7 +154,15 @@ async function main(port) {
   const manifestUrl = `http://127.0.0.1:${port}/manifest`
   const artifact = path.join(os.tmpdir(), 'obs-streamelements-setup-20260729000746.exe')
   fs.writeFileSync(artifact, Buffer.alloc(4096, 7))
-  const common = { 'api-key': 'fake-key', 'api-url': api }
+  // Rate limiting off for the functional checks: the 4/min default is correct for production but
+  // would pace this suite out to several minutes. It gets its own checks at the end.
+  const common = {
+    'api-key': 'fake-key',
+    'api-url': api,
+    'rate-limit-per-minute': '0',
+    'rate-limit-per-day': '0',
+    'rate-limit-per-month': '0'
+  }
 
   console.log('--- the bundle loads and runs at all ---')
   let run = await runAction({ ...common, mode: 'upload', files: artifact, version: '20260729000746' })
@@ -220,6 +238,41 @@ async function main(port) {
   run = await runAction({ ...common, mode: 'prune', 'quota-bytes': '1000', 'on-error': 'warn' })
   check('exit 0', run.exitCode === 0, run.exitCode)
   check('warned instead of failing', /::warning::/.test(run.stdout), run.stdout.slice(0, 300))
+
+  console.log('--- rate limiting: seeds from the API and reports request count ---')
+  state.quotaReads = 0
+  run = await runAction({
+    ...common,
+    ...pruneInputs,
+    'rate-limit-per-minute': '0',
+    'rate-limit-per-day': '500',
+    'rate-limit-per-month': '15500',
+    'dry-run': 'true'
+  })
+  check('read the key quota once', state.quotaReads === 1, state.quotaReads)
+  check(
+    'logged the usage VirusTotal reported',
+    /137 API request\(s\) used today of 500 allowed/.test(run.stdout),
+    run.stdout.slice(0, 400)
+  )
+  check('reported how many requests it made', Number(run.outputs['api-requests']) > 0, run.outputs['api-requests'])
+
+  console.log('--- rate limiting: an exhausted budget fails fast, it does not hang ---')
+  const startedAt = Date.now()
+  run = await runAction({
+    ...common,
+    ...pruneInputs,
+    'rate-limit-per-day': '1',
+    'rate-limit-seed-from-api': 'false',
+    'dry-run': 'true'
+  })
+  check('exited non-zero', run.exitCode !== 0, run.exitCode)
+  check(
+    'explained the wait would exceed the cap',
+    /would require waiting 86400s, beyond the 300s cap/.test(run.stdout),
+    run.stdout.slice(0, 400)
+  )
+  check('returned promptly rather than blocking', Date.now() - startedAt < 30_000, `${Date.now() - startedAt}ms`)
 }
 
 server.listen(0, '127.0.0.1', async () => {

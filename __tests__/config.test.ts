@@ -96,6 +96,42 @@ describe('parseConfig', () => {
     ).toThrow(/must be below high-watermark/)
   })
 
+  it('defaults to the public VirusTotal allowances', () => {
+    const config = parseConfig(reader(base))
+    expect(config.rateLimits).toEqual({
+      perMinute: 4,
+      perDay: 500,
+      perMonth: 15500,
+      maxWaitMs: 300_000
+    })
+    expect(config.seedRateLimitFromApi).toBe(true)
+  })
+
+  it('accepts raised limits and 0 to disable a window', () => {
+    const config = parseConfig(
+      reader({
+        ...base,
+        'rate-limit-per-minute': '240',
+        'rate-limit-per-day': '0',
+        'rate-limit-max-wait': '30',
+        'rate-limit-seed-from-api': 'false'
+      })
+    )
+    expect(config.rateLimits.perMinute).toBe(240)
+    expect(config.rateLimits.perDay).toBe(0)
+    expect(config.rateLimits.maxWaitMs).toBe(30_000)
+    expect(config.seedRateLimitFromApi).toBe(false)
+  })
+
+  it('rejects negative or fractional limits', () => {
+    expect(() => parseConfig(reader({ ...base, 'rate-limit-per-minute': '-1' }))).toThrow(
+      /rate-limit-per-minute must be a non-negative integer/
+    )
+    expect(() => parseConfig(reader({ ...base, 'rate-limit-per-day': '2.5' }))).toThrow(
+      /rate-limit-per-day must be a non-negative integer/
+    )
+  })
+
   it('rejects unknown modes and error policies', () => {
     expect(() => parseConfig(reader({ ...base, mode: 'delete-everything' }))).toThrow(/mode must be one of/)
     expect(() => parseConfig(reader({ ...base, 'on-error': 'shrug' }))).toThrow(/on-error must be/)

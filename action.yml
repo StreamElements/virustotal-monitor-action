@@ -68,6 +68,32 @@ inputs:
       statistics = use Monitor's daily storage snapshot (cheaper, up to a day stale).
     required: false
     default: 'walk'
+  rate-limit-per-minute:
+    description: |
+      Maximum VirusTotal API requests per minute. The default matches the public API allowance;
+      raise it if the key has a higher rate. 0 disables this window.
+    required: false
+    default: '4'
+  rate-limit-per-day:
+    description: 'Maximum VirusTotal API requests per day. 0 disables this window.'
+    required: false
+    default: '500'
+  rate-limit-per-month:
+    description: 'Maximum VirusTotal API requests per month (rolling 30 days). 0 disables this window.'
+    required: false
+    default: '15500'
+  rate-limit-max-wait:
+    description: |
+      Seconds a single request may wait for a rate-limit slot before the step gives up. Stops a
+      job from hanging for hours when a budget is exhausted.
+    required: false
+    default: '300'
+  rate-limit-seed-from-api:
+    description: |
+      Read the key's current daily/monthly usage from VirusTotal at startup so those budgets
+      account for requests made outside this run. Costs one API request.
+    required: false
+    default: 'true'
   dry-run:
     description: 'Log what would be uploaded/deleted without changing anything.'
     required: false
@@ -100,6 +126,8 @@ outputs:
     description: 'Monitor storage usage after pruning.'
   usage-ratio:
     description: 'Usage as a fraction of the quota after pruning.'
+  api-requests:
+    description: 'Number of VirusTotal API requests this run made.'
 
 runs:
   using: 'node20'

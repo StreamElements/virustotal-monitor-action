@@ -37052,6 +37052,7 @@ exports.parseSize = parseSize;
 exports.parseWatermark = parseWatermark;
 exports.parseConfig = parseConfig;
 const paths_1 = __nccwpck_require__(8431);
+const rate_limiter_1 = __nccwpck_require__(4796);
 const vt_client_1 = __nccwpck_require__(4721);
 const SIZE_UNITS = {
     b: 1,
@@ -37109,6 +37110,14 @@ function parseBoolean(raw, name, fallback) {
 }
 function withDefault(raw, fallback) {
     return raw.trim().length > 0 ? raw.trim() : fallback;
+}
+/** Non-negative integer, where 0 means "no limit". */
+function parseLimit(raw, name, fallback) {
+    const value = raw.trim().length > 0 ? Number(raw.trim()) : fallback;
+    if (!Number.isInteger(value) || value < 0) {
+        throw new Error(`${name} must be a non-negative integer (0 disables it), got "${raw}"`);
+    }
+    return value;
 }
 function parseConfig(getInput) {
     const apiKey = getInput('api-key').trim();
@@ -37169,7 +37178,14 @@ function parseConfig(getInput) {
         pinnedVersions: parseList(getInput('pin-versions')),
         dryRun: parseBoolean(getInput('dry-run'), 'dry-run', false),
         onError,
-        usageSource
+        usageSource,
+        rateLimits: {
+            perMinute: parseLimit(getInput('rate-limit-per-minute'), 'rate-limit-per-minute', rate_limiter_1.DEFAULT_RATE_LIMITS.perMinute),
+            perDay: parseLimit(getInput('rate-limit-per-day'), 'rate-limit-per-day', rate_limiter_1.DEFAULT_RATE_LIMITS.perDay),
+            perMonth: parseLimit(getInput('rate-limit-per-month'), 'rate-limit-per-month', rate_limiter_1.DEFAULT_RATE_LIMITS.perMonth),
+            maxWaitMs: parseLimit(getInput('rate-limit-max-wait'), 'rate-limit-max-wait', rate_limiter_1.DEFAULT_RATE_LIMITS.maxWaitMs / 1000) * 1000
+        },
+        seedRateLimitFromApi: parseBoolean(getInput('rate-limit-seed-from-api'), 'rate-limit-seed-from-api', true)
     };
 }
 
@@ -37258,6 +37274,7 @@ const glob = __importStar(__nccwpck_require__(7206));
 const config_1 = __nccwpck_require__(2973);
 const manifests_1 = __nccwpck_require__(8977);
 const prune_1 = __nccwpck_require__(4023);
+const rate_limiter_1 = __nccwpck_require__(4796);
 const upload_1 = __nccwpck_require__(1550);
 const vt_client_1 = __nccwpck_require__(4721);
 const logger = {
@@ -37268,11 +37285,14 @@ const logger = {
 async function run() {
     const config = (0, config_1.parseConfig)(name => core.getInput(name));
     core.setSecret(config.apiKey);
+    const rateLimiter = new rate_limiter_1.RateLimiter(config.rateLimits, { logger });
     const client = new vt_client_1.MonitorClient({
         apiKey: config.apiKey,
         apiUrl: config.apiUrl,
-        logger
+        logger,
+        rateLimiter
     });
+    await seedRateLimiter(client, rateLimiter, config);
     if (config.dryRun) {
         core.info('Running in dry-run mode — no uploads and no deletions will be performed.');
     }
@@ -37303,6 +37323,10 @@ async function run() {
             logger
         });
     }
+    const rateStats = rateLimiter.stats();
+    core.info(`Made ${rateStats.requests} VirusTotal API request(s)` +
+        (rateStats.waitedMs > 0 ? `, ${Math.round(rateStats.waitedMs / 1000)}s of that waiting on rate limits` : ''));
+    core.setOutput('api-requests', rateStats.requests);
     setOutputs(uploadResult, pruneResult);
     try {
         await writeSummary(config, uploadResult, pruneResult);
@@ -37313,6 +37337,28 @@ async function run() {
     }
     if (pruneResult && pruneResult.errors.length > 0) {
         throw new Error(`${pruneResult.errors.length} item(s) failed to delete:\n${pruneResult.errors.join('\n')}`);
+    }
+}
+/**
+ * Folds VirusTotal's own usage figures into the limiter. Without this the daily and monthly
+ * budgets only bound the current run, since each job starts with an empty history.
+ */
+async function seedRateLimiter(client, rateLimiter, config) {
+    const tracksLongWindows = config.rateLimits.perDay > 0 || config.rateLimits.perMonth > 0;
+    if (!config.seedRateLimitFromApi || !tracksLongWindows)
+        return;
+    try {
+        const quotas = await client.getApiQuotas();
+        rateLimiter.seed({ day: quotas.dailyUsed, month: quotas.monthlyUsed });
+        if (quotas.dailyUsed !== undefined) {
+            core.info(`VirusTotal reports ${quotas.dailyUsed} API request(s) used today` +
+                `${quotas.dailyAllowed !== undefined ? ` of ${quotas.dailyAllowed} allowed` : ''}`);
+        }
+    }
+    catch (error) {
+        // Not every key can read its own quotas; fall back to pacing this run only.
+        core.warning(`Could not read VirusTotal quota usage (${error.message}). Daily and monthly ` +
+            'limits will only account for requests made by this run.');
     }
 }
 async function loadManifests(config) {
@@ -37847,6 +37893,134 @@ function dedupe(items) {
 
 /***/ }),
 
+/***/ 4796:
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.RateLimiter = exports.RateLimitExceededError = exports.DEFAULT_RATE_LIMITS = exports.MONTH_MS = exports.DAY_MS = exports.MINUTE_MS = void 0;
+const logging_1 = __nccwpck_require__(1338);
+/**
+ * Client-side rate limiting for the VirusTotal API.
+ *
+ * VirusTotal enforces three budgets on a key — per minute, per day, per month — and answers
+ * with HTTP 429 once one is crossed. Backing off after the fact still burns the request, so we
+ * pace ourselves instead: `acquire()` blocks until making a call would stay inside every window.
+ *
+ * The honest caveat is that a CI run is short-lived and starts with an empty history, so the
+ * day and month windows can only bound *this run* on their own. `seed()` fixes that by folding
+ * in the usage VirusTotal itself reports for the key, which is what makes those two budgets
+ * meaningful across runs.
+ */
+exports.MINUTE_MS = 60_000;
+exports.DAY_MS = 24 * 60 * exports.MINUTE_MS;
+/** VirusTotal's monthly budget is a calendar month; a rolling 30 days is the safe approximation. */
+exports.MONTH_MS = 30 * exports.DAY_MS;
+exports.DEFAULT_RATE_LIMITS = {
+    perMinute: 4,
+    perDay: 500,
+    perMonth: 15500,
+    maxWaitMs: 5 * exports.MINUTE_MS
+};
+class RateLimitExceededError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'RateLimitExceededError';
+    }
+}
+exports.RateLimitExceededError = RateLimitExceededError;
+class RateLimiter {
+    constructor(config, deps = {}) {
+        /** Timestamps of requests made by this run, oldest first. */
+        this.history = [];
+        this.waitedMs = 0;
+        const windows = [
+            { name: 'minute', spanMs: exports.MINUTE_MS, limit: config.perMinute, spent: 0 },
+            { name: 'day', spanMs: exports.DAY_MS, limit: config.perDay, spent: 0 },
+            { name: 'month', spanMs: exports.MONTH_MS, limit: config.perMonth, spent: 0 }
+        ];
+        this.windows = windows.filter(window => window.limit > 0);
+        this.maxWaitMs = config.maxWaitMs;
+        this.now = deps.now ?? Date.now;
+        this.sleep = deps.sleep ?? (ms => new Promise(resolve => setTimeout(resolve, ms)));
+        this.logger = deps.logger ?? logging_1.silentLogger;
+    }
+    /** Folds in usage VirusTotal reports for the key, so day/month budgets survive across runs. */
+    seed(used) {
+        for (const window of this.windows) {
+            const value = window.name === 'day' ? used.day : window.name === 'month' ? used.month : undefined;
+            if (typeof value === 'number' && value >= 0)
+                window.spent = value;
+        }
+    }
+    /** Blocks until a request may be made, then records it. */
+    async acquire() {
+        for (;;) {
+            const now = this.now();
+            this.forget(now);
+            const blocked = this.windows.filter(window => this.used(window, now) >= window.limit);
+            if (blocked.length === 0) {
+                this.history.push(now);
+                return;
+            }
+            let waitMs = 0;
+            for (const window of blocked) {
+                const oldest = this.history.find(timestamp => timestamp > now - window.spanMs);
+                if (oldest === undefined) {
+                    // Nothing of ours is in the window, so only VirusTotal's own count can be holding us
+                    // back — waiting cannot help within this job.
+                    throw new RateLimitExceededError(`VirusTotal's ${window.name} quota is already exhausted (${window.spent} of ${window.limit} ` +
+                        'used before this run). Wait for the quota to reset, or raise ' +
+                        `rate-limit-per-${window.name}.`);
+                }
+                waitMs = Math.max(waitMs, oldest + window.spanMs - now);
+            }
+            if (waitMs > this.maxWaitMs) {
+                throw new RateLimitExceededError(`Rate limiting would require waiting ${Math.round(waitMs / 1000)}s, beyond the ` +
+                    `${Math.round(this.maxWaitMs / 1000)}s cap. Raise rate-limit-per-minute if the key allows ` +
+                    'a higher rate, or rate-limit-max-wait to allow a longer pause.');
+            }
+            this.logger.debug(`Rate limit reached (${blocked.map(w => w.name).join(', ')}) — waiting ${Math.round(waitMs / 1000)}s`);
+            this.waitedMs += waitMs;
+            await this.sleep(waitMs);
+        }
+    }
+    /** Requests made by this run, and how long it spent waiting on the limiter. */
+    stats() {
+        const now = this.now();
+        const remaining = {};
+        for (const window of this.windows) {
+            remaining[window.name] = Math.max(0, window.limit - this.used(window, now));
+        }
+        return { requests: this.history.length, waitedMs: this.waitedMs, remaining };
+    }
+    used(window, now) {
+        const cutoff = now - window.spanMs;
+        let count = 0;
+        for (let i = this.history.length - 1; i >= 0; i--) {
+            if (this.history[i] <= cutoff)
+                break;
+            count++;
+        }
+        return count + window.spent;
+    }
+    /** Drops history older than the widest window so a long run does not grow unboundedly. */
+    forget(now) {
+        const widest = this.windows.reduce((max, window) => Math.max(max, window.spanMs), 0);
+        const cutoff = now - widest;
+        let drop = 0;
+        while (drop < this.history.length && this.history[drop] <= cutoff)
+            drop++;
+        if (drop > 0)
+            this.history = this.history.slice(drop);
+    }
+}
+exports.RateLimiter = RateLimiter;
+
+
+/***/ }),
+
 /***/ 1550:
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
@@ -38034,6 +38208,7 @@ function versionSpellings(version) {
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.MonitorClient = exports.MonitorApiError = exports.DIRECT_UPLOAD_LIMIT_BYTES = exports.DEFAULT_API_URL = void 0;
+exports.parseRetryAfter = parseRetryAfter;
 const node_fs_1 = __nccwpck_require__(3024);
 const undici_1 = __nccwpck_require__(6752);
 const logging_1 = __nccwpck_require__(1338);
@@ -38084,6 +38259,19 @@ class MonitorClient {
         this.logger = options.logger ?? logging_1.silentLogger;
         this.requestFn = options.requestFn ?? undici_1.request;
         this.sleepFn = options.sleepFn ?? defaultSleep;
+        this.rateLimiter = options.rateLimiter;
+    }
+    /**
+     * Usage VirusTotal reports for this key. Used to seed the rate limiter so the daily and
+     * monthly budgets account for requests made outside this run.
+     */
+    async getApiQuotas() {
+        const payload = await this.json('GET', `/users/${encodeURIComponent(this.apiKey)}/overall_quotas`);
+        return {
+            dailyUsed: payload.data?.api_requests_daily?.used,
+            dailyAllowed: payload.data?.api_requests_daily?.allowed,
+            monthlyUsed: payload.data?.api_requests_monthly?.used
+        };
     }
     /** Direct children of a Monitor folder (files and sub-folders). */
     async listFolder(folderPath) {
@@ -38195,12 +38383,17 @@ class MonitorClient {
     }
     async send(options) {
         let lastError;
+        let retryAfterMs;
         for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
             if (attempt > 0) {
-                const delay = this.retryBaseMs * 2 ** (attempt - 1);
+                const delay = retryAfterMs ?? this.retryBaseMs * 2 ** (attempt - 1);
                 this.logger.debug(`Retry ${attempt}/${this.maxRetries} for ${options.method} ${options.url} in ${delay}ms`);
                 await this.sleepFn(delay);
             }
+            retryAfterMs = undefined;
+            // A retry costs quota just like the first attempt, so it is paced too.
+            if (this.rateLimiter)
+                await this.rateLimiter.acquire();
             try {
                 const response = await this.requestFn(options.url, {
                     method: options.method,
@@ -38222,6 +38415,8 @@ class MonitorClient {
                 if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === this.maxRetries) {
                     throw error;
                 }
+                // When VirusTotal says how long to wait, believe it over our own backoff curve.
+                retryAfterMs = parseRetryAfter(response.headers);
                 this.logger.warning(`${error.message} — retrying`);
                 lastError = error;
             }
@@ -38244,6 +38439,18 @@ class MonitorClient {
     }
 }
 exports.MonitorClient = MonitorClient;
+/** `Retry-After` is either a delay in seconds or an HTTP date. Capped so a bad value can't stall a job. */
+function parseRetryAfter(headers, now = Date.now()) {
+    const raw = headers?.['retry-after'];
+    const value = Array.isArray(raw) ? raw[0] : raw;
+    if (!value)
+        return undefined;
+    const seconds = Number(value);
+    const ms = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(value) - now;
+    if (!Number.isFinite(ms) || ms <= 0)
+        return undefined;
+    return Math.min(ms, 5 * 60_000);
+}
 function toApiError(statusCode, text, method, url) {
     let code;
     let detail = text.slice(0, 500);

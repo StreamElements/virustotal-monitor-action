@@ -7,6 +7,7 @@ import { ActionConfig, parseConfig } from './config'
 import { Logger } from './logging'
 import { ManifestIndex, emptyManifestIndex, fetchManifests } from './manifests'
 import { runPrune } from './prune'
+import { RateLimiter } from './rate-limiter'
 import { PruneResult, UploadResult } from './types'
 import { formatBytes, runUpload } from './upload'
 import { MonitorClient } from './vt-client'
@@ -21,11 +22,15 @@ export async function run(): Promise<void> {
   const config = parseConfig(name => core.getInput(name))
   core.setSecret(config.apiKey)
 
+  const rateLimiter = new RateLimiter(config.rateLimits, { logger })
   const client = new MonitorClient({
     apiKey: config.apiKey,
     apiUrl: config.apiUrl,
-    logger
+    logger,
+    rateLimiter
   })
+
+  await seedRateLimiter(client, rateLimiter, config)
 
   if (config.dryRun) {
     core.info('Running in dry-run mode — no uploads and no deletions will be performed.')
@@ -61,6 +66,13 @@ export async function run(): Promise<void> {
     })
   }
 
+  const rateStats = rateLimiter.stats()
+  core.info(
+    `Made ${rateStats.requests} VirusTotal API request(s)` +
+      (rateStats.waitedMs > 0 ? `, ${Math.round(rateStats.waitedMs / 1000)}s of that waiting on rate limits` : '')
+  )
+  core.setOutput('api-requests', rateStats.requests)
+
   setOutputs(uploadResult, pruneResult)
   try {
     await writeSummary(config, uploadResult, pruneResult)
@@ -71,6 +83,36 @@ export async function run(): Promise<void> {
 
   if (pruneResult && pruneResult.errors.length > 0) {
     throw new Error(`${pruneResult.errors.length} item(s) failed to delete:\n${pruneResult.errors.join('\n')}`)
+  }
+}
+
+/**
+ * Folds VirusTotal's own usage figures into the limiter. Without this the daily and monthly
+ * budgets only bound the current run, since each job starts with an empty history.
+ */
+async function seedRateLimiter(
+  client: MonitorClient,
+  rateLimiter: RateLimiter,
+  config: ActionConfig
+): Promise<void> {
+  const tracksLongWindows = config.rateLimits.perDay > 0 || config.rateLimits.perMonth > 0
+  if (!config.seedRateLimitFromApi || !tracksLongWindows) return
+
+  try {
+    const quotas = await client.getApiQuotas()
+    rateLimiter.seed({ day: quotas.dailyUsed, month: quotas.monthlyUsed })
+    if (quotas.dailyUsed !== undefined) {
+      core.info(
+        `VirusTotal reports ${quotas.dailyUsed} API request(s) used today` +
+          `${quotas.dailyAllowed !== undefined ? ` of ${quotas.dailyAllowed} allowed` : ''}`
+      )
+    }
+  } catch (error) {
+    // Not every key can read its own quotas; fall back to pacing this run only.
+    core.warning(
+      `Could not read VirusTotal quota usage (${(error as Error).message}). Daily and monthly ` +
+        'limits will only account for requests made by this run.'
+    )
   }
 }
 

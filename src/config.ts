@@ -1,4 +1,5 @@
 import { joinPath, normalizePath } from './paths'
+import { DEFAULT_RATE_LIMITS, RateLimitConfig } from './rate-limiter'
 import { DEFAULT_API_URL } from './vt-client'
 
 export type Mode = 'upload' | 'prune' | 'upload-and-prune'
@@ -19,6 +20,8 @@ export interface ActionConfig {
   dryRun: boolean
   onError: 'fail' | 'warn'
   usageSource: 'walk' | 'statistics'
+  rateLimits: RateLimitConfig
+  seedRateLimitFromApi: boolean
 }
 
 export type InputReader = (name: string) => string
@@ -75,6 +78,15 @@ function parseBoolean(raw: string, name: string, fallback: boolean): boolean {
 
 function withDefault(raw: string, fallback: string): string {
   return raw.trim().length > 0 ? raw.trim() : fallback
+}
+
+/** Non-negative integer, where 0 means "no limit". */
+function parseLimit(raw: string, name: string, fallback: number): number {
+  const value = raw.trim().length > 0 ? Number(raw.trim()) : fallback
+  if (!Number.isInteger(value) || value < 0) {
+    throw new Error(`${name} must be a non-negative integer (0 disables it), got "${raw}"`)
+  }
+  return value
 }
 
 export function parseConfig(getInput: InputReader): ActionConfig {
@@ -144,6 +156,18 @@ export function parseConfig(getInput: InputReader): ActionConfig {
     pinnedVersions: parseList(getInput('pin-versions')),
     dryRun: parseBoolean(getInput('dry-run'), 'dry-run', false),
     onError,
-    usageSource
+    usageSource,
+    rateLimits: {
+      perMinute: parseLimit(getInput('rate-limit-per-minute'), 'rate-limit-per-minute', DEFAULT_RATE_LIMITS.perMinute),
+      perDay: parseLimit(getInput('rate-limit-per-day'), 'rate-limit-per-day', DEFAULT_RATE_LIMITS.perDay),
+      perMonth: parseLimit(getInput('rate-limit-per-month'), 'rate-limit-per-month', DEFAULT_RATE_LIMITS.perMonth),
+      maxWaitMs:
+        parseLimit(
+          getInput('rate-limit-max-wait'),
+          'rate-limit-max-wait',
+          DEFAULT_RATE_LIMITS.maxWaitMs / 1000
+        ) * 1000
+    },
+    seedRateLimitFromApi: parseBoolean(getInput('rate-limit-seed-from-api'), 'rate-limit-seed-from-api', true)
   }
 }

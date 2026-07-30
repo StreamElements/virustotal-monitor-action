@@ -69,6 +69,11 @@ storage housekeeping must never take a release down with it.
 | `manifest-urls` | | Newline-separated channel manifest URLs. Required to prune for real. |
 | `pin-versions` | | Extra versions to protect. |
 | `usage-source` | `walk` | `walk` sums the live item tree; `statistics` uses Monitor's daily snapshot (cheaper, up to a day stale). |
+| `rate-limit-per-minute` | `4` | Max API requests per minute. `0` disables the window. |
+| `rate-limit-per-day` | `500` | Max API requests per day. `0` disables the window. |
+| `rate-limit-per-month` | `15500` | Max API requests per rolling 30 days. `0` disables the window. |
+| `rate-limit-max-wait` | `300` | Seconds a single request may wait for a slot before the step gives up. |
+| `rate-limit-seed-from-api` | `true` | Read the key's current usage from VirusTotal at startup. Costs one request. |
 | `dry-run` | `false` | Log the plan, change nothing. |
 | `on-error` | `fail` | `fail` for uploads, `warn` for prune. |
 | `api-url` | VirusTotal v3 | Override only for testing. |
@@ -84,7 +89,7 @@ if an error message would otherwise echo it.
 ## Outputs
 
 `uploaded-count`, `skipped-count`, `uploaded-paths`, `prune-triggered`, `deleted-count`,
-`deleted-versions`, `freed-bytes`, `usage-bytes`, `usage-ratio`.
+`deleted-versions`, `freed-bytes`, `usage-bytes`, `usage-ratio`, `api-requests`.
 
 Every run also writes a job summary with usage before/after and the exact list of versions
 deleted or kept.
@@ -117,6 +122,44 @@ A version folder is kept when **any** of these hold:
 Everything else is a candidate. Candidates are deleted oldest-first — version order, not upload
 order — until usage is under `target-watermark`. If the policy protects too much to reach the
 target, the run reports the shortfall as a warning instead of deleting something protected.
+
+## Rate limiting
+
+VirusTotal enforces three budgets per key and answers with HTTP 429 once one is crossed.
+Backing off after a 429 still spends the request, so the action paces itself instead: every call
+waits for a slot in all three windows before going out. Retries are paced too — a retry costs
+quota exactly like a first attempt — and when VirusTotal sends a `Retry-After`, that wins over
+the local backoff curve.
+
+Defaults are the public API allowances: **4/minute, 500/day, 15500/month**. Set any to `0` to
+disable that window; raise them if the key allows more (a Monitor-enabled account usually does,
+and running a prune at 4/minute is slow — see below).
+
+A CI job is short-lived and starts with no request history, so on their own the daily and monthly
+windows could only bound a single run. `rate-limit-seed-from-api` closes that gap: at startup the
+action reads the key's current usage from `/users/{key}/overall_quotas` and folds it in, which is
+what makes those budgets mean anything across runs. It costs one request, and if the key cannot
+read its own quotas the step warns and paces this run only.
+
+**Two ways a run can stop on rate limits, both loud rather than hanging:**
+
+- The wait needed exceeds `rate-limit-max-wait` (default 300s) — e.g. the daily budget is full and
+  the next slot is hours away.
+- VirusTotal already reported the budget as spent before the run started, so waiting cannot help.
+
+For prune jobs, pair this with `on-error: warn` so a rate-limit stop never fails the release.
+
+**Roughly what a run costs**, which is what to size the limits against:
+
+| Run | Requests |
+| --- | --- |
+| Upload, 2 installers | 1 folder listing + 1 per file, + 1 for seeding = ~4 |
+| Prune, 10 versions, nothing to delete | seeding + root walk + prefix walk + 1 per version folder = ~13 |
+| Prune that deletes 3 versions | the above + 2 per version deleted (file + folder) = ~19 |
+
+At the default 4/minute the first four are immediate and everything after paces at one per 15
+seconds, so a ~19-request prune takes about four minutes of wall clock. That is fine on a
+schedule, and it is the reason the upload step is worth keeping separate from the prune step.
 
 ## Runbook
 
@@ -162,8 +205,13 @@ the manifests do not mention yet, add it to `pin-versions`.
   re-run later.
 - **Shortfall warning** — everything left is protected. Lower `keep-versions`, or accept it and
   raise the quota with VirusTotal.
-- **HTTP 429** — the client retries with backoff four times; a persistent 429 means the key's
-  quota is exhausted.
+- **HTTP 429** — should be rare now that calls are paced; it means the key's real limits are
+  lower than the configured ones. The client honours `Retry-After` and retries four times, but
+  lower `rate-limit-per-minute` to match reality rather than relying on retries.
+- **`Rate limiting would require waiting …`** or **`quota is already exhausted`** — the run hit a
+  configured budget. Raise the limit if the key allows more, wait for the reset, or let the
+  scheduled run pick it up tomorrow (prune should use `on-error: warn`, so it will not fail the
+  job).
 
 ## Notes on the VirusTotal API
 

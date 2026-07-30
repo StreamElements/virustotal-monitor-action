@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 
-import { DIRECT_UPLOAD_LIMIT_BYTES, MonitorApiError, MonitorClient } from '../src/vt-client'
+import { DIRECT_UPLOAD_LIMIT_BYTES, MonitorApiError, MonitorClient, parseRetryAfter } from '../src/vt-client'
 
 interface Call {
   url: string
@@ -12,7 +12,9 @@ interface Call {
   body?: string
 }
 
-function fakeTransport(responses: Array<{ statusCode: number; payload?: unknown; raw?: string }>) {
+function fakeTransport(
+  responses: Array<{ statusCode: number; payload?: unknown; raw?: string; headers?: Record<string, string> }>
+) {
   const calls: Call[] = []
   let index = 0
 
@@ -34,7 +36,7 @@ function fakeTransport(responses: Array<{ statusCode: number; payload?: unknown;
     const response = responses[Math.min(index, responses.length - 1)]
     index++
     const text = response.raw ?? JSON.stringify(response.payload ?? {})
-    return { statusCode: response.statusCode, headers: {}, body: { text: async () => text } }
+    return { statusCode: response.statusCode, headers: response.headers ?? {}, body: { text: async () => text } }
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
   }) as any
 
@@ -199,6 +201,137 @@ describe('deleteItem', () => {
     await client(requestFn).deleteItem('bW9uaXRvcg==/plus+slash')
     expect(calls[0].method).toBe('DELETE')
     expect(calls[0].url).toBe('https://vt.test/api/v3/monitor/items/bW9uaXRvcg%3D%3D%2Fplus%2Bslash')
+  })
+})
+
+describe('rate limiting', () => {
+  it('acquires a slot before every request, including each paginated page', async () => {
+    const acquire = jest.fn().mockResolvedValue(undefined)
+    const { requestFn } = fakeTransport([
+      { statusCode: 200, payload: { data: [item('/a/one.exe')], meta: { cursor: 'C' } } },
+      { statusCode: 200, payload: { data: [item('/a/two.exe')] } }
+    ])
+
+    const paced = new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      sleepFn: async () => undefined,
+      retryBaseMs: 0,
+      rateLimiter: { acquire }
+    })
+    await paced.listFolder('/a')
+
+    expect(acquire).toHaveBeenCalledTimes(2)
+  })
+
+  it('also paces retries, since a retry spends quota too', async () => {
+    const acquire = jest.fn().mockResolvedValue(undefined)
+    const { requestFn } = fakeTransport([
+      { statusCode: 429, payload: { error: { code: 'QuotaExceededError', message: 'slow down' } } },
+      { statusCode: 200, payload: { data: [] } }
+    ])
+
+    const paced = new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      sleepFn: async () => undefined,
+      retryBaseMs: 0,
+      rateLimiter: { acquire }
+    })
+    await paced.listFolder('/a')
+
+    expect(acquire).toHaveBeenCalledTimes(2)
+  })
+
+  it('waits for the Retry-After VirusTotal asks for instead of its own backoff', async () => {
+    const slept: number[] = []
+    const { requestFn } = fakeTransport([
+      { statusCode: 429, headers: { 'retry-after': '42' }, payload: { error: { message: 'slow down' } } },
+      { statusCode: 200, payload: { data: [] } }
+    ])
+
+    const paced = new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      sleepFn: async ms => {
+        slept.push(ms)
+      },
+      retryBaseMs: 1000
+    })
+    await paced.listFolder('/a')
+
+    expect(slept).toEqual([42_000])
+  })
+
+  it('falls back to exponential backoff when no Retry-After is sent', async () => {
+    const slept: number[] = []
+    const { requestFn } = fakeTransport([
+      { statusCode: 429, payload: { error: { message: 'slow down' } } },
+      { statusCode: 200, payload: { data: [] } }
+    ])
+
+    const paced = new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      sleepFn: async ms => {
+        slept.push(ms)
+      },
+      retryBaseMs: 1000
+    })
+    await paced.listFolder('/a')
+
+    expect(slept).toEqual([1000])
+  })
+})
+
+describe('parseRetryAfter', () => {
+  const now = Date.parse('2026-07-30T12:00:00Z')
+
+  it('reads a delay in seconds', () => {
+    expect(parseRetryAfter({ 'retry-after': '30' }, now)).toBe(30_000)
+  })
+
+  it('reads an HTTP date', () => {
+    expect(parseRetryAfter({ 'retry-after': 'Thu, 30 Jul 2026 12:00:45 GMT' }, now)).toBe(45_000)
+  })
+
+  it('caps an absurd value so a bad header cannot stall the job', () => {
+    expect(parseRetryAfter({ 'retry-after': '99999' }, now)).toBe(5 * 60_000)
+  })
+
+  it('ignores missing, unparseable and past values', () => {
+    expect(parseRetryAfter(undefined, now)).toBeUndefined()
+    expect(parseRetryAfter({}, now)).toBeUndefined()
+    expect(parseRetryAfter({ 'retry-after': 'soon' }, now)).toBeUndefined()
+    expect(parseRetryAfter({ 'retry-after': '0' }, now)).toBeUndefined()
+    expect(parseRetryAfter({ 'retry-after': 'Thu, 30 Jul 2026 11:59:00 GMT' }, now)).toBeUndefined()
+  })
+})
+
+describe('getApiQuotas', () => {
+  it('reads the daily and monthly usage VirusTotal reports for the key', async () => {
+    const { calls, requestFn } = fakeTransport([
+      {
+        statusCode: 200,
+        payload: {
+          data: {
+            api_requests_daily: { allowed: 500, used: 137 },
+            api_requests_monthly: { allowed: 15500, used: 4021 }
+          }
+        }
+      }
+    ])
+
+    await expect(client(requestFn).getApiQuotas()).resolves.toEqual({
+      dailyUsed: 137,
+      dailyAllowed: 500,
+      monthlyUsed: 4021
+    })
+    expect(calls[0].url).toBe('https://vt.test/api/v3/users/test-key/overall_quotas')
   })
 })
 
