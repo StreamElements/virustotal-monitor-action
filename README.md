@@ -93,10 +93,24 @@ deleted or kept.
 
 A version folder is kept when **any** of these hold:
 
-1. A live channel manifest (`qa`, `beta`, `latest`, `stable`) mentions its version or one of its
-   filenames. Manifests are matched as text against every spelling of the version
-   (`20260729000746`, `20260729.000746`, `26.7.29.746`, …), so an unfamiliar manifest format
-   still protects the release.
+1. A live channel manifest mentions its version or one of its filenames. Manifests are matched
+   as text against every spelling of the version (`20260729000746`, `20260729.000746`,
+   `26.7.29.746`, …), so an unfamiliar manifest format still protects the release.
+
+   The five live manifests are one per channel plus the signed pointer:
+
+   ```
+   https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/signed/obs-streamelements.manifest
+   https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/qa/obs-streamelements.manifest
+   https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/beta/obs-streamelements.manifest
+   https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/latest/obs-streamelements.manifest
+   https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/stable/obs-streamelements.manifest
+   ```
+
+   They disagree about installer filenames — `signed/` uses `-<version>.exe` and
+   `-<version>-64bit.exe`, qa/beta/latest use `-x86-`/`-x64-`, and stable drops the version from
+   the filename entirely (`obs-streamelements-setup.exe?v=20241127000268`). Matching on the
+   version rather than the filename is what makes all five work.
 2. It is one of the newest `keep-versions` per prefix (default 10).
 3. It is listed in `pin-versions`.
 

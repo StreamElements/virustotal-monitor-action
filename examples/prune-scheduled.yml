@@ -49,15 +49,17 @@ jobs:
           # Anything these point at is never deleted. If any of them cannot be fetched, the
           # step fails rather than pruning with an incomplete picture of what is live.
           #
-          # CONFIRM THESE URLS before enabling deletion — the paths below follow the
-          # package_url convention in template.manifest but were not reachable when this
-          # example was written. Run once with dry-run: true and check the job summary lists
-          # the live releases as "kept (manifest)".
+          # Each channel is its own directory holding one obs-streamelements.manifest; signed/
+          # additionally pins the most recent signed build. The channels disagree about
+          # installer filenames (signed/ uses -<version>.exe and -<version>-64bit.exe, qa/beta/
+          # latest use -x86-/-x64-, stable drops the version from the filename entirely), so
+          # matching keys off version_number, which all five carry.
           manifest-urls: |
-            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/signed/obs-streamelements.qa.manifest
-            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/signed/obs-streamelements.beta.manifest
-            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/signed/obs-streamelements.latest.manifest
-            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/signed/obs-streamelements.stable.manifest
+            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/signed/obs-streamelements.manifest
+            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/qa/obs-streamelements.manifest
+            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/beta/obs-streamelements.manifest
+            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/latest/obs-streamelements.manifest
+            https://cdn.streamelements.com/obs/dist/obs-streamelements/windows/stable/obs-streamelements.manifest
           # Scheduled runs default to enforcing; manual runs default to previewing.
           dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry-run || 'false' }}
           # Storage housekeeping must never take a release down with it.
