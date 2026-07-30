@@ -344,6 +344,12 @@ npm run all       # all four, in order
 `dist/` is the bundle GitHub actually runs (`ncc`, node20 runtime). Source lives in `src/`,
 tests in `__tests__/`.
 
+Build from an **LF** working tree. `dist/index.js.map` embeds the source text, so building with
+CRLF checkouts produces a map a couple of kilobytes larger than the one CI builds on Linux, and
+the dist-freshness check fails on a bundle that is otherwise identical. `.gitattributes` enforces
+`eol=lf`; a checkout that predates it can be corrected with `git rm --cached -r . && git reset
+--hard`.
+
 **Run `npm run smoke` after any dependency change.** A green `npm run build` does not mean the
 bundle works: `ncc` can silently stub a dependency out and still exit 0, producing a bundle that
 passes typecheck, unit tests and the dist-freshness check but dies with `Cannot find module` on
