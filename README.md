@@ -246,16 +246,23 @@ gh release create v1.2.3 --title "v1.2.3 — …" --latest --notes-file notes.md
 Breaking changes to inputs or behaviour get a new major (`v2` plus a new moving tag), leaving
 `v1` where it is so existing workflows keep working.
 
-Because the repository is **internal**, other repositories in the organization can only use this
-action if its Actions access policy allows it. That is already set, and reads back as:
+### Why this repository is public
 
-```bash
-gh api repos/StreamElements/virustotal-monitor-action/actions/permissions/access
-# {"access_level":"organization"}
+`obs-streamelements-core` is public, and **a public repository cannot consume a private or
+internal action** — GitHub reports it as:
+
+```
+Unable to resolve action `streamelements/virustotal-monitor-action`, not found
 ```
 
-If a consuming workflow ever fails to resolve the action, check that first — the symptom is a
-"repository not found" style error that looks like a bad tag but is not.
+which reads like a bad tag or a casing mistake and is neither. Sharing an internal repo's actions
+with the organization (`actions/permissions/access` → `organization`) extends access to *private
+and internal* repos only; public consumers stay locked out. Since the upload step has to run in
+the public release repo, this repository is public. Keep it that way, or the release pipeline
+breaks the next time the tag is bumped.
+
+Nothing here is sensitive: the API key is always an input, and the paths and manifest URLs are
+already visible in the public workflow that calls it.
 
 ## Development
 
