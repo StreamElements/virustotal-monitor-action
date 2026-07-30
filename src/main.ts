@@ -9,11 +9,18 @@ import { ManifestIndex, emptyManifestIndex, fetchManifests } from './manifests'
 import { runPrune } from './prune'
 import { RateLimiter } from './rate-limiter'
 import { PruneResult, UploadResult } from './types'
-import { formatBytes, runUpload } from './upload'
+import { formatBytes, formatDuration } from './format'
+import { runUpload } from './upload'
 import { MonitorClient } from './vt-client'
 
+/**
+ * `verbose: true` routes debug output to info so it shows without the repository-level
+ * ACTIONS_STEP_DEBUG secret, which not everyone can set.
+ */
+let verbose = false
+
 const logger: Logger = {
-  debug: message => core.debug(message),
+  debug: message => (verbose ? core.info(message) : core.debug(message)),
   info: message => core.info(message),
   warning: message => core.warning(message)
 }
@@ -21,6 +28,9 @@ const logger: Logger = {
 export async function run(): Promise<void> {
   const config = parseConfig(name => core.getInput(name))
   core.setSecret(config.apiKey)
+  verbose = config.verbose
+
+  describeRun(config)
 
   const rateLimiter = new RateLimiter(config.rateLimits, { logger })
   const client = new MonitorClient({
@@ -32,16 +42,15 @@ export async function run(): Promise<void> {
 
   await seedRateLimiter(client, rateLimiter, config)
 
-  if (config.dryRun) {
-    core.info('Running in dry-run mode — no uploads and no deletions will be performed.')
-  }
-
   let uploadResult: UploadResult | undefined
   let pruneResult: PruneResult | undefined
+  const startedAt = Date.now()
 
   if (config.mode === 'upload' || config.mode === 'upload-and-prune') {
+    core.info('')
+    core.info(`== Upload → ${config.remoteDir} ==`)
     const files = await resolveFiles(config.filePatterns)
-    core.info(`Uploading ${files.length} file(s) to ${config.remoteDir}`)
+    core.info(`${files.length} local file(s) matched the configured patterns`)
     uploadResult = await runUpload(client, {
       files,
       remoteDir: config.remoteDir,
@@ -51,6 +60,8 @@ export async function run(): Promise<void> {
   }
 
   if (config.mode === 'prune' || config.mode === 'upload-and-prune') {
+    core.info('')
+    core.info('== Prune ==')
     const manifests = await loadManifests(config)
     pruneResult = await runPrune(client, {
       prefixes: config.managedPrefixes,
@@ -67,10 +78,16 @@ export async function run(): Promise<void> {
   }
 
   const rateStats = rateLimiter.stats()
+  core.info('')
+  core.info('== Done ==')
   core.info(
-    `Made ${rateStats.requests} VirusTotal API request(s)` +
-      (rateStats.waitedMs > 0 ? `, ${Math.round(rateStats.waitedMs / 1000)}s of that waiting on rate limits` : '')
+    `${rateStats.requests} VirusTotal API request(s) in ${formatDuration(Date.now() - startedAt)}` +
+      (rateStats.waitedMs > 0 ? `, of which ${formatDuration(rateStats.waitedMs)} was rate-limit waiting` : '')
   )
+  const headroom = Object.entries(rateStats.remaining)
+    .map(([window, left]) => `${left} per ${window}`)
+    .join(', ')
+  if (headroom) core.info(`Requests still available: ${headroom}`)
   core.setOutput('api-requests', rateStats.requests)
 
   setOutputs(uploadResult, pruneResult)
@@ -84,6 +101,45 @@ export async function run(): Promise<void> {
   if (pruneResult && pruneResult.errors.length > 0) {
     throw new Error(`${pruneResult.errors.length} item(s) failed to delete:\n${pruneResult.errors.join('\n')}`)
   }
+}
+
+/** States up front what this run will do and under what settings, so the log explains itself. */
+function describeRun(config: ActionConfig): void {
+  core.info(`VirusTotal Monitor — mode: ${config.mode}${config.dryRun ? ', DRY RUN' : ''}`)
+
+  if (config.dryRun) {
+    core.info('Dry run: every decision is logged, nothing is uploaded and nothing is deleted.')
+  }
+  if (config.mode !== 'prune') {
+    core.info(`Uploading into ${config.remoteDir}; identical files already there are skipped.`)
+  }
+  if (config.mode !== 'upload') {
+    core.info(
+      `Pruning ${config.managedPrefixes.join(', ')} once usage passes ` +
+        `${(config.highWatermark * 100).toFixed(0)}% of ${formatBytes(config.quotaBytes)}, ` +
+        `down to ${(config.targetWatermark * 100).toFixed(0)}%. Keeping the newest ` +
+        `${config.keepVersions} version(s) per prefix plus anything a live manifest references.`
+    )
+  }
+  core.info(
+    `Rate limits: ${describeLimit(config.rateLimits.perMinute, 'minute')}, ` +
+      `${describeLimit(config.rateLimits.perDay, 'day')}, ` +
+      `${describeLimit(config.rateLimits.perMonth, 'month')}. ` +
+      `Failures ${config.onError === 'warn' ? 'warn only' : 'fail the job'}.`
+  )
+  if (config.rateLimits.perMinute > 0 && config.rateLimits.perMinute <= 10) {
+    core.info(
+      `At ${config.rateLimits.perMinute} request(s) per minute expect roughly ` +
+        `${Math.round(60 / config.rateLimits.perMinute)}s between calls, so listing many folders takes a while.`
+    )
+  }
+  if (!verbose) {
+    core.info('Set verbose: true (or ACTIONS_STEP_DEBUG) for per-request logging.')
+  }
+}
+
+function describeLimit(limit: number, window: string): string {
+  return limit > 0 ? `${limit}/${window}` : `${window} unlimited`
 }
 
 /**
@@ -118,8 +174,13 @@ async function seedRateLimiter(
 
 async function loadManifests(config: ActionConfig): Promise<ManifestIndex> {
   if (config.manifestUrls.length > 0) {
-    core.info(`Reading ${config.manifestUrls.length} channel manifest(s) to determine what is still live`)
-    return fetchManifests(config.manifestUrls, { logger })
+    core.info(
+      `Fetching ${config.manifestUrls.length} channel manifest(s) from the CDN. Whatever they ` +
+        'reference is never deleted, and a manifest that fails to load aborts the prune.'
+    )
+    const index = await fetchManifests(config.manifestUrls, { logger })
+    core.info(`All ${config.manifestUrls.length} manifest(s) read successfully`)
+    return index
   }
 
   // Deleting without knowing what the channels point at is the one mistake we cannot undo.

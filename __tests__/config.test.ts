@@ -123,6 +123,11 @@ describe('parseConfig', () => {
     expect(config.seedRateLimitFromApi).toBe(false)
   })
 
+  it('defaults verbose off and accepts it being switched on', () => {
+    expect(parseConfig(reader(base)).verbose).toBe(false)
+    expect(parseConfig(reader({ ...base, verbose: 'true' })).verbose).toBe(true)
+  })
+
   it('rejects negative or fractional limits', () => {
     expect(() => parseConfig(reader({ ...base, 'rate-limit-per-minute': '-1' }))).toThrow(
       /rate-limit-per-minute must be a non-negative integer/

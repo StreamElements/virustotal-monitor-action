@@ -22,6 +22,8 @@ export interface ActionConfig {
   usageSource: 'walk' | 'statistics'
   rateLimits: RateLimitConfig
   seedRateLimitFromApi: boolean
+  /** Route debug output to info, so per-request detail shows without ACTIONS_STEP_DEBUG. */
+  verbose: boolean
 }
 
 export type InputReader = (name: string) => string
@@ -168,6 +170,7 @@ export function parseConfig(getInput: InputReader): ActionConfig {
           DEFAULT_RATE_LIMITS.maxWaitMs / 1000
         ) * 1000
     },
-    seedRateLimitFromApi: parseBoolean(getInput('rate-limit-seed-from-api'), 'rate-limit-seed-from-api', true)
+    seedRateLimitFromApi: parseBoolean(getInput('rate-limit-seed-from-api'), 'rate-limit-seed-from-api', true),
+    verbose: parseBoolean(getInput('verbose'), 'verbose', false)
   }
 }

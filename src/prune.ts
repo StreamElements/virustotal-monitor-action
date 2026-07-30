@@ -2,7 +2,7 @@ import { Logger, silentLogger } from './logging'
 import { ManifestIndex, emptyManifestIndex } from './manifests'
 import { basename, isUnder, joinPath, normalizePath, segmentUnder } from './paths'
 import { MonitorItem, PruneResult, RetentionDecision, VersionGroup } from './types'
-import { formatBytes } from './upload'
+import { formatBytes, formatDuration } from './format'
 import { compareVersions, versionSpellings } from './version'
 import { MonitorClient } from './vt-client'
 
@@ -272,9 +272,24 @@ async function collectUsage(
   // items under the managed prefixes are prunable. The managed prefixes are then walked
   // directly and merged in: a root listing that does not expose the intermediate folders
   // would otherwise report zero usage and silently disable pruning.
+  logger.info(
+    'Enumerating existing items in VirusTotal Monitor storage to measure usage. Monitor has no ' +
+      'recursive listing, so this is one request per folder and is usually the slowest part of the run.'
+  )
+  const startedAt = Date.now()
+
+  logger.info('Walking the Monitor root (/) for account-wide usage')
   const fromRoot = await client.walk('/')
+
+  logger.info(`Walking the managed prefix(es): ${options.prefixes.join(', ')}`)
   const fromPrefixes = (await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat()
   const items = dedupe([...fromRoot, ...fromPrefixes])
+
+  const fileCount = items.filter(item => item.itemType === 'file').length
+  logger.info(
+    `Enumerated ${items.length} item(s) — ${fileCount} file(s), ` +
+      `${items.length - fileCount} folder(s) — in ${formatDuration(Date.now() - startedAt)}`
+  )
 
   const usageBytes = items
     .filter(item => item.itemType === 'file')

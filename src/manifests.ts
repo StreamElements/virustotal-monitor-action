@@ -40,7 +40,11 @@ export async function fetchManifests(urls: string[], options: FetchManifestsOpti
   if (urls.length === 0) return emptyManifestIndex
 
   const texts: string[] = []
-  for (const url of urls) {
+  for (const [index, url] of urls.entries()) {
+    // These are CDN fetches, not VirusTotal calls, so they are not rate limited and should be
+    // quick. Numbering them makes it obvious when the slow part is what comes after.
+    logger.info(`  [${index + 1}/${urls.length}] ${url}`)
+    const startedAt = Date.now()
     const response = await requestFn(url, {
       method: 'GET',
       headers: { 'user-agent': 'streamelements-virustotal-monitor-action' },
@@ -51,7 +55,12 @@ export async function fetchManifests(urls: string[], options: FetchManifestsOpti
     if (response.statusCode < 200 || response.statusCode >= 300) {
       throw new Error(`Failed to fetch manifest ${url}: HTTP ${response.statusCode} ${text.slice(0, 200)}`)
     }
-    logger.debug(`Fetched manifest ${url} (${text.length} bytes)`)
+
+    const version = /^\s*version_number\s*=\s*(\S+)/im.exec(text)?.[1]
+    logger.info(
+      `      HTTP ${response.statusCode}, ${text.length} bytes, ${Date.now() - startedAt}ms` +
+        `${version ? ` — currently serving version ${version}` : ''}`
+    )
     texts.push(text.toLowerCase())
   }
 

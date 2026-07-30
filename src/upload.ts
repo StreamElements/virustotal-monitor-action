@@ -1,5 +1,6 @@
 import { stat } from 'node:fs/promises'
 
+import { formatBytes } from './format'
 import { sha256File } from './hash'
 import { Logger, silentLogger } from './logging'
 import { basename, joinPath, normalizePath } from './paths'
@@ -31,17 +32,35 @@ export async function planUpload(client: MonitorClient, options: UploadOptions):
       throw new Error(`Not a file: ${localPath}`)
     }
     const remotePath = joinPath(remoteDir, basename(localPath))
+
+    // Hashing is what makes a re-run idempotent: identical bytes are never uploaded twice.
+    logger.debug(`Hashing ${localPath} (${formatBytes(stats.size)}) to compare against Monitor`)
     const sha256 = await sha256File(localPath)
+    logger.debug(`  sha256 ${sha256}`)
     const match = existing.get(remotePath)
 
     if (!match) {
+      logger.debug(`  ${remotePath} is not in Monitor yet — will upload`)
       plan.push({ localPath, remotePath, size: stats.size, sha256, action: 'create' })
     } else if (match.sha256 && match.sha256.toLowerCase() === sha256) {
+      logger.debug(`  ${remotePath} already holds these exact bytes — will skip`)
       plan.push({ localPath, remotePath, size: stats.size, sha256, action: 'skip', existingItemId: match.id })
     } else {
+      logger.debug(
+        `  ${remotePath} exists with a different sha256 (${match.sha256 ?? 'unknown'}) — ` +
+          'will overwrite that item in place rather than create a second copy'
+      )
       plan.push({ localPath, remotePath, size: stats.size, sha256, action: 'overwrite', existingItemId: match.id })
     }
   }
+
+  const counts = plan.reduce<Record<string, number>>((acc, entry) => {
+    acc[entry.action] = (acc[entry.action] ?? 0) + 1
+    return acc
+  }, {})
+  logger.info(
+    `Plan: ${counts.create ?? 0} to upload, ${counts.overwrite ?? 0} to overwrite, ${counts.skip ?? 0} unchanged`
+  )
   return plan
 }
 
@@ -89,10 +108,12 @@ async function listExisting(
   logger: Logger
 ): Promise<Map<string, MonitorItem>> {
   const byPath = new Map<string, MonitorItem>()
+  logger.info(`Checking what ${remoteDir} already holds, so a re-run does not duplicate items`)
   try {
     for (const item of await client.listFolder(remoteDir)) {
       if (item.itemType === 'file') byPath.set(item.path, item)
     }
+    logger.info(`  ${byPath.size} file(s) already present`)
   } catch (error) {
     // A first-ever upload for this version has no folder yet; Monitor answers 404.
     if (error instanceof MonitorApiError && error.statusCode === 404) {
@@ -104,13 +125,3 @@ async function listExisting(
   return byPath
 }
 
-export function formatBytes(bytes: number): string {
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
-  let value = bytes
-  let unit = 0
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024
-    unit++
-  }
-  return `${unit === 0 ? value : value.toFixed(2)} ${units[unit]}`
-}

@@ -2,6 +2,7 @@ import { createReadStream } from 'node:fs'
 import { Readable } from 'node:stream'
 import { request } from 'undici'
 
+import { formatBytes } from './format'
 import { Logger, silentLogger } from './logging'
 import { buildMultipart } from './multipart'
 import { RateLimiter } from './rate-limiter'
@@ -157,9 +158,16 @@ export class MonitorClient {
     const queue = [normalizePath(rootPath)]
     const visitedFolders = new Set<string>(queue)
 
+    let listed = 0
     while (queue.length > 0) {
       const folder = queue.shift() as string
-      this.logger.debug(`Listing ${asFolderPath(folder)}`)
+      listed++
+      // Monitor has no recursive listing, so this is one request per folder — and at the default
+      // rate limit that is ~15s each. Report progress at info level or the job looks stalled.
+      this.logger.info(
+        `Listing ${asFolderPath(folder)} — folder ${listed}` +
+          `${queue.length > 0 ? ` of ${listed + queue.length} known so far` : ''}, ${collected.length} item(s) found`
+      )
       for (const item of await this.listFolder(folder)) {
         if (seen.has(item.id)) continue
         seen.add(item.id)
@@ -176,6 +184,16 @@ export class MonitorClient {
 
   async deleteItem(id: string): Promise<void> {
     await this.json('DELETE', `/monitor/items/${encodeURIComponent(id)}`)
+  }
+
+  /**
+   * Strips the API key out of anything about to be logged or thrown. The key appears in the
+   * path of /users/{key}/overall_quotas, so a plain URL is enough to leak it. `core.setSecret`
+   * would mask it on a runner, but a credential should not be written out and then masked.
+   */
+  private redact(text: string): string {
+    if (!this.apiKey) return text
+    return text.split(this.apiKey).join('***').split(encodeURIComponent(this.apiKey)).join('***')
   }
 
   /** Most recent daily storage snapshot, or undefined when Monitor has no statistics yet. */
@@ -280,7 +298,9 @@ export class MonitorClient {
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       if (attempt > 0) {
         const delay = retryDelayMs ?? this.retryBaseMs * 2 ** (attempt - 1)
-        this.logger.debug(`Retry ${attempt}/${this.maxRetries} for ${options.method} ${options.url} in ${delay}ms`)
+        this.logger.debug(
+          `Retry ${attempt}/${this.maxRetries} for ${options.method} ${this.redact(options.url)} in ${delay}ms`
+        )
         await this.sleepFn(delay)
       }
       retryDelayMs = undefined
@@ -289,6 +309,13 @@ export class MonitorClient {
       if (this.rateLimiter) await this.rateLimiter.acquire()
 
       const url = options.resolveUrl ? await options.resolveUrl() : options.url
+      const startedAt = Date.now()
+      const safeUrl = this.redact(url)
+      const attemptOf = attempt > 0 ? ` (attempt ${attempt + 1} of ${this.maxRetries + 1})` : ''
+      const bodySize = options.headers?.['content-length']
+      this.logger.debug(
+        `→ ${options.method} ${safeUrl}${bodySize ? ` [${formatBytes(Number(bodySize))} body]` : ''}${attemptOf}`
+      )
 
       try {
         const response = await this.requestFn(url, {
@@ -305,11 +332,17 @@ export class MonitorClient {
         })
 
         const text = await response.body.text()
+        this.logger.debug(
+          `← ${response.statusCode} in ${Date.now() - startedAt}ms, ${text.length} byte(s) of body`
+        )
+        // Response headers only. Request headers carry x-apikey and are never logged.
+        this.logger.debug(`  headers: ${formatHeaders(response.headers)}`)
+
         if (response.statusCode >= 200 && response.statusCode < 300) {
           return (text.length > 0 ? JSON.parse(text) : {}) as T
         }
 
-        const error = toApiError(response.statusCode, text, options.method, url)
+        const error = toApiError(response.statusCode, text, options.method, safeUrl)
         if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === this.maxRetries) {
           throw error
         }
@@ -340,13 +373,30 @@ export class MonitorClient {
         // Network-level failure (reset socket, DNS, timeout): worth another attempt.
         const error = caught instanceof Error ? caught : new Error(String(caught))
         if (attempt === this.maxRetries) throw error
-        this.logger.warning(`${options.method} ${url} failed: ${error.message} — retrying`)
+        this.logger.warning(`${options.method} ${safeUrl} failed: ${this.redact(error.message)} — retrying`)
         lastError = error
       }
     }
 
-    throw lastError ?? new Error(`${options.method} ${options.url} failed`)
+    throw lastError ?? new Error(`${options.method} ${this.redact(options.url)} failed`)
   }
+}
+
+/**
+ * Renders response headers for the debug log. Only ever called with *response* headers —
+ * request headers carry the API key and must not reach the log.
+ */
+export function formatHeaders(headers: Record<string, string | string[] | undefined> | undefined): string {
+  if (!headers) return '(none)'
+  const rendered = Object.keys(headers)
+    .sort()
+    // A cookie is of no diagnostic use here and is the one response header worth not printing.
+    .filter(name => name.toLowerCase() !== 'set-cookie')
+    .map(name => {
+      const value = headers[name]
+      return `${name}=${Array.isArray(value) ? value.join(',') : value}`
+    })
+  return rendered.length > 0 ? rendered.join(' ') : '(none)'
 }
 
 /** `Retry-After` is either a delay in seconds or an HTTP date. Capped so a bad value can't stall a job. */

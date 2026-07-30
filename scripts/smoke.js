@@ -162,11 +162,13 @@ function runAction(inputs) {
   // the event loop and deadlock waiting for a response it can never send.
   return new Promise(resolve => {
     execFile(process.execPath, [ACTION], { env }, (error, stdout, stderr) => {
-      resolve({
-        exitCode: error ? (error.code ?? 1) : 0,
-        stdout: `${stdout}${stderr}`,
-        outputs: parseOutputs(outputFile)
-      })
+      const combined = `${stdout}${stderr}`
+      // SMOKE_SHOW_OUTPUT=1 prints what the action actually logged — handy when working on the
+      // log output itself, rather than inferring it from which assertions failed.
+      if (process.env.SMOKE_SHOW_OUTPUT) {
+        console.log(combined.replace(/^/gm, '    │ '))
+      }
+      resolve({ exitCode: error ? (error.code ?? 1) : 0, stdout: combined, outputs: parseOutputs(outputFile) })
     })
   })
 }
@@ -310,6 +312,31 @@ async function main(port) {
   )
   fs.unlinkSync(bigFile)
 
+  console.log('--- normal output explains each stage ---')
+  run = await runAction({ ...common, ...pruneInputs, 'dry-run': 'true' })
+  const says = pattern => new RegExp(pattern, 'm').test(run.stdout)
+  check('states the mode up front', says('^VirusTotal Monitor — mode: prune, DRY RUN'), run.stdout.slice(0, 200))
+  check('explains the retention policy', says('Keeping the newest .* version\\(s\\) per prefix'), '')
+  check('numbers the manifest fetches', says('\\[1/1\\] http'), '')
+  check('warns before the slow enumeration', says('^Enumerating existing items in VirusTotal Monitor storage'), '')
+  check('reports what enumeration found', says('^Enumerated \\d+ item\\(s\\)'), '')
+  check('shows per-folder progress', says('^Listing /.* — folder 1'), '')
+  check('closes with a request count', says('VirusTotal API request\\(s\\) in '), '')
+  check('hides per-request detail by default', !says('^→ GET'), 'request logging leaked into normal output')
+
+  console.log('--- verbose mode logs every call and its response headers ---')
+  run = await runAction({ ...common, ...pruneInputs, 'dry-run': 'true', verbose: 'true' })
+  const verbosely = pattern => new RegExp(pattern, 'm').test(run.stdout)
+  check('logs the outgoing request', verbosely('^→ GET http'), run.stdout.slice(0, 300))
+  check('logs the status and timing', verbosely('^← 200 in \\d+ms'), '')
+  check('logs response headers', verbosely('^  headers: .*content-type='), '')
+  // ::add-mask:: has to contain the key — that directive is what tells the runner to mask it.
+  // Any other line containing it is a leak, most likely a URL that embeds the key in its path.
+  const leaked = run.stdout
+    .split(/\r?\n/)
+    .filter(line => line.includes('fake-key') && !line.startsWith('::add-mask::'))
+  check('never logs the api key outside the mask directive', leaked.length === 0, JSON.stringify(leaked.slice(0, 3)))
+
   console.log('--- rate limiting: seeds from the API and reports request count ---')
   state.quotaReads = 0
   run = await runAction({
@@ -318,9 +345,21 @@ async function main(port) {
     'rate-limit-per-minute': '0',
     'rate-limit-per-day': '500',
     'rate-limit-per-month': '15500',
-    'dry-run': 'true'
+    'dry-run': 'true',
+    verbose: 'true'
   })
   check('read the key quota once', state.quotaReads === 1, state.quotaReads)
+  // The quota endpoint carries the key in its path, so this is the one URL that must be redacted.
+  check(
+    'redacted the key out of the quota URL',
+    /\/users\/\*\*\*\/overall_quotas/.test(run.stdout),
+    run.stdout.split(/\r?\n/).filter(l => l.includes('overall_quotas')).slice(0, 2).join(' | ')
+  )
+  check(
+    'and the raw key never appears alongside it',
+    run.stdout.split(/\r?\n/).filter(l => l.includes('fake-key') && !l.startsWith('::add-mask::')).length === 0,
+    'leaked'
+  )
   check(
     'logged the usage VirusTotal reported',
     /137 API request\(s\) used today of 500 allowed/.test(run.stdout),

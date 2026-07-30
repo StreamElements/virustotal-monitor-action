@@ -34,6 +34,9 @@ export const DEFAULT_RATE_LIMITS: RateLimitConfig = {
   maxWaitMs: 5 * MINUTE_MS
 }
 
+/** Waits at least this long are surfaced at info level rather than debug. */
+const NOTICEABLE_WAIT_MS = 2000
+
 export interface RateLimiterDeps {
   now?: () => number
   sleep?: (ms: number) => Promise<void>
@@ -112,7 +115,11 @@ export class RateLimiter {
               `${Math.round(this.maxWaitMs / 1000)}s cap set by rate-limit-max-wait.`
           )
         }
-        this.logger.debug(`Holding ${Math.round(waitMs / 1000)}s after a 429 from VirusTotal`)
+        this.report(
+          waitMs,
+          `Holding all VirusTotal calls for ${Math.round(waitMs / 1000)}s after a 429 — the key's real ` +
+            'limits are tighter than the configured ones.'
+        )
         this.waitedMs += waitMs
         await this.sleep(waitMs)
         continue
@@ -147,8 +154,15 @@ export class RateLimiter {
         )
       }
 
-      this.logger.debug(
-        `Rate limit reached (${blocked.map(w => w.name).join(', ')}) — waiting ${Math.round(waitMs / 1000)}s`
+      // A silent pause reads as a hung job, so anything the user would notice is said out loud.
+      const window = blocked[0]
+      const detail =
+        `${window.limit} request(s) per ${window.name}` +
+        (window.spent > 0 ? `, ${window.spent} of them already used before this run` : '')
+      this.report(
+        waitMs,
+        `Pausing ${Math.round(waitMs / 1000)}s to stay within VirusTotal's rate limit — ${detail}. ` +
+          `Raise rate-limit-per-${window.name} if the key allows a higher rate.`
       )
       this.waitedMs += waitMs
       await this.sleep(waitMs)
@@ -163,6 +177,15 @@ export class RateLimiter {
       remaining[window.name] = Math.max(0, window.limit - this.used(window, now))
     }
     return { requests: this.history.length, waitedMs: this.waitedMs, remaining }
+  }
+
+  /**
+   * A pause long enough to notice is announced at info level; sub-second ones stay in debug so
+   * a fast run is not drowned in noise.
+   */
+  private report(waitMs: number, message: string): void {
+    if (waitMs >= NOTICEABLE_WAIT_MS) this.logger.info(message)
+    else this.logger.debug(message)
   }
 
   private used(window: Window, now: number): number {

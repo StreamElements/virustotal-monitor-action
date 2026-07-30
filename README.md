@@ -74,6 +74,7 @@ storage housekeeping must never take a release down with it.
 | `rate-limit-per-month` | `15500` | Max API requests per rolling 30 days. `0` disables the window. |
 | `rate-limit-max-wait` | `300` | Seconds a single request may wait for a slot before the step gives up. |
 | `rate-limit-seed-from-api` | `true` | Read the key's current usage from VirusTotal at startup. Costs one request. |
+| `verbose` | `false` | Log every API call, status, timing and response headers. |
 | `dry-run` | `false` | Log the plan, change nothing. |
 | `on-error` | `fail` | `fail` for uploads, `warn` for prune. |
 | `api-url` | VirusTotal v3 | Override only for testing. |
@@ -93,6 +94,51 @@ if an error message would otherwise echo it.
 
 Every run also writes a job summary with usage before/after and the exact list of versions
 deleted or kept.
+
+## Reading the log
+
+The run opens by stating what it is about to do and under which settings — mode, dry-run,
+watermarks, retention, rate limits — so a log read months later explains itself without needing
+the workflow file alongside it.
+
+The slow part is enumerating Monitor storage. There is no recursive listing, so it is one
+request per folder, and at 4 requests/minute that is ~15s each. Every folder is announced as it
+is listed, with a running count, because a paced run with no output is indistinguishable from a
+hung one:
+
+```
+Fetching 5 channel manifest(s) from the CDN. Whatever they reference is never deleted…
+  [1/5] https://cdn.streamelements.com/…/signed/obs-streamelements.manifest
+      HTTP 200, 412 bytes, 88ms — currently serving version 20260729000708
+Enumerating existing items in VirusTotal Monitor storage to measure usage. Monitor has no
+recursive listing, so this is one request per folder and is usually the slowest part of the run.
+Listing /obs-streamelements/windows/ — folder 1, 0 item(s) found
+Listing /obs-streamelements/windows/20260729000708/ — folder 2 of 6 known so far, 5 item(s) found
+Pausing 15s to stay within VirusTotal's rate limit — 4 request(s) per minute. Raise
+rate-limit-per-minute if the key allows a higher rate.
+Enumerated 23 item(s) — 18 file(s), 5 folder(s) — in 2m 14s
+```
+
+Rate-limit pauses over two seconds are announced with which window caused them and what to
+change; shorter ones stay in debug so a fast run stays quiet.
+
+### verbose
+
+`verbose: true` logs each request, its status, duration and response headers:
+
+```
+→ GET https://www.virustotal.com/api/v3/monitor/items?filter=path%3A%2F&limit=40
+← 200 in 412ms, 1183 byte(s) of body
+  headers: content-type=application/json x-ratelimit-remaining=17
+```
+
+It is equivalent to setting `ACTIONS_STEP_DEBUG`, but per step, so it works without the
+repository secret that not everyone can set.
+
+**Request headers are never logged** — they carry `x-apikey`. The one URL that embeds the key is
+`/users/{key}/overall_quotas`, and the key is redacted out of it (`/users/***/overall_quotas`) in
+both logs and error messages. `core.setSecret` would mask it on a runner anyway, but a credential
+should not be written out and then masked; there is a test asserting it never appears.
 
 ## Retention policy
 

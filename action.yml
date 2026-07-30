@@ -94,6 +94,13 @@ inputs:
       account for requests made outside this run. Costs one API request.
     required: false
     default: 'true'
+  verbose:
+    description: |
+      Log every API call, its status, timing and response headers. Equivalent to enabling
+      ACTIONS_STEP_DEBUG, but settable per step. Request headers are never logged — they carry
+      the API key.
+    required: false
+    default: 'false'
   dry-run:
     description: 'Log what would be uploaded/deleted without changing anything.'
     required: false

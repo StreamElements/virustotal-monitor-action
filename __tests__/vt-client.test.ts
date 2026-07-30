@@ -3,7 +3,13 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
 
-import { DIRECT_UPLOAD_LIMIT_BYTES, MonitorApiError, MonitorClient, parseRetryAfter } from '../src/vt-client'
+import {
+  DIRECT_UPLOAD_LIMIT_BYTES,
+  MonitorApiError,
+  MonitorClient,
+  formatHeaders,
+  parseRetryAfter
+} from '../src/vt-client'
 
 interface Call {
   url: string
@@ -417,6 +423,123 @@ describe('rate limiting', () => {
     await paced.listFolder('/a')
 
     expect(penalize).toHaveBeenCalledWith(90_000)
+  })
+})
+
+describe('verbose logging', () => {
+  function capturing() {
+    const debug: string[] = []
+    const info: string[] = []
+    return { debug: (m: string) => debug.push(m), info: (m: string) => info.push(m), warning: () => undefined, lines: { debug, info } }
+  }
+
+  it('logs the request, the response and its headers at debug level', async () => {
+    const log = capturing()
+    const { requestFn } = fakeTransport([
+      {
+        statusCode: 200,
+        headers: { 'content-type': 'application/json', 'x-ratelimit-remaining': '17' },
+        payload: { data: [] }
+      }
+    ])
+
+    await new MonitorClient({
+      apiKey: 'test-key',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      logger: log
+    }).listFolder('/a')
+
+    const debugged = log.lines.debug.join('\n')
+    expect(debugged).toMatch(/→ GET https:\/\/vt\.test\/api\/v3\/monitor\/items\?/)
+    expect(debugged).toMatch(/← 200 in \d+ms, \d+ byte\(s\) of body/)
+    expect(debugged).toContain('headers: content-type=application/json x-ratelimit-remaining=17')
+  })
+
+  it('redacts the api key from the quota URL, which carries it in the path', async () => {
+    const log = capturing()
+    const { requestFn } = fakeTransport([{ statusCode: 200, payload: { data: {} } }])
+
+    await new MonitorClient({
+      apiKey: 'super-secret-key',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      logger: log
+    }).getApiQuotas()
+
+    const logged = [...log.lines.debug, ...log.lines.info].join('\n')
+    expect(logged).not.toContain('super-secret-key')
+    expect(logged).toContain('/users/***/overall_quotas')
+  })
+
+  it('keeps the key out of error messages too, which surface in job output', async () => {
+    const log = capturing()
+    const { requestFn } = fakeTransport([
+      { statusCode: 404, payload: { error: { code: 'NotFoundError', message: 'nope' } } }
+    ])
+
+    const client = new MonitorClient({
+      apiKey: 'super-secret-key',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      logger: log
+    })
+
+    await expect(client.getApiQuotas()).rejects.toThrow(/\/users\/\*\*\*\/overall_quotas/)
+    await expect(client.getApiQuotas()).rejects.not.toThrow(/super-secret-key/)
+  })
+
+  it('reports progress per folder while walking, so a paced run does not look stalled', async () => {
+    const log = capturing()
+    const { requestFn } = fakeTransport([
+      { statusCode: 200, payload: { data: [item('/root/v1', { item_type: 'folder' })] } },
+      { statusCode: 200, payload: { data: [item('/root/v1/setup.exe')] } },
+      { statusCode: 200, payload: { data: [] } }
+    ])
+
+    await new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      logger: log
+    }).walk('/root')
+
+    expect(log.lines.info).toEqual([
+      expect.stringContaining('Listing /root/ — folder 1'),
+      expect.stringContaining('Listing /root/v1/ — folder 2')
+    ])
+  })
+
+  it('announces the upload body size rather than dumping the body', async () => {
+    const log = capturing()
+    const dir = await mkdtemp(join(tmpdir(), 'vt-log-'))
+    const file = join(dir, 'setup.exe')
+    await writeFile(file, 'installer')
+    const { requestFn } = fakeTransport([{ statusCode: 200, payload: { data: { id: 'x' } } }])
+
+    await new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      logger: log
+    }).uploadFile({ localPath: file, remotePath: '/a/setup.exe', size: 9 })
+
+    expect(log.lines.debug.join('\n')).toMatch(/→ POST \S+ \[\d+ B body\]/)
+    expect(log.lines.debug.join('\n')).not.toContain('installer')
+  })
+})
+
+describe('formatHeaders', () => {
+  it('sorts headers and joins array values', () => {
+    expect(formatHeaders({ b: '2', a: '1', c: ['x', 'y'] })).toBe('a=1 b=2 c=x,y')
+  })
+
+  it('omits cookies and copes with nothing at all', () => {
+    expect(formatHeaders({ 'set-cookie': 'session=abc', 'content-type': 'text/plain' })).toBe(
+      'content-type=text/plain'
+    )
+    expect(formatHeaders({})).toBe('(none)')
+    expect(formatHeaders(undefined)).toBe('(none)')
   })
 })
 

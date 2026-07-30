@@ -37185,8 +37185,40 @@ function parseConfig(getInput) {
             perMonth: parseLimit(getInput('rate-limit-per-month'), 'rate-limit-per-month', rate_limiter_1.DEFAULT_RATE_LIMITS.perMonth),
             maxWaitMs: parseLimit(getInput('rate-limit-max-wait'), 'rate-limit-max-wait', rate_limiter_1.DEFAULT_RATE_LIMITS.maxWaitMs / 1000) * 1000
         },
-        seedRateLimitFromApi: parseBoolean(getInput('rate-limit-seed-from-api'), 'rate-limit-seed-from-api', true)
+        seedRateLimitFromApi: parseBoolean(getInput('rate-limit-seed-from-api'), 'rate-limit-seed-from-api', true),
+        verbose: parseBoolean(getInput('verbose'), 'verbose', false)
     };
+}
+
+
+/***/ }),
+
+/***/ 6264:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.formatBytes = formatBytes;
+exports.formatDuration = formatDuration;
+function formatBytes(bytes) {
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+    let value = bytes;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+        value /= 1024;
+        unit++;
+    }
+    return `${unit === 0 ? value : value.toFixed(2)} ${units[unit]}`;
+}
+function formatDuration(ms) {
+    if (ms < 1000)
+        return `${Math.round(ms)}ms`;
+    const seconds = ms / 1000;
+    if (seconds < 90)
+        return `${seconds.toFixed(1)}s`;
+    const minutes = Math.floor(seconds / 60);
+    return `${minutes}m ${Math.round(seconds - minutes * 60)}s`;
 }
 
 
@@ -37275,16 +37307,24 @@ const config_1 = __nccwpck_require__(2973);
 const manifests_1 = __nccwpck_require__(8977);
 const prune_1 = __nccwpck_require__(4023);
 const rate_limiter_1 = __nccwpck_require__(4796);
+const format_1 = __nccwpck_require__(6264);
 const upload_1 = __nccwpck_require__(1550);
 const vt_client_1 = __nccwpck_require__(4721);
+/**
+ * `verbose: true` routes debug output to info so it shows without the repository-level
+ * ACTIONS_STEP_DEBUG secret, which not everyone can set.
+ */
+let verbose = false;
 const logger = {
-    debug: message => core.debug(message),
+    debug: message => (verbose ? core.info(message) : core.debug(message)),
     info: message => core.info(message),
     warning: message => core.warning(message)
 };
 async function run() {
     const config = (0, config_1.parseConfig)(name => core.getInput(name));
     core.setSecret(config.apiKey);
+    verbose = config.verbose;
+    describeRun(config);
     const rateLimiter = new rate_limiter_1.RateLimiter(config.rateLimits, { logger });
     const client = new vt_client_1.MonitorClient({
         apiKey: config.apiKey,
@@ -37293,14 +37333,14 @@ async function run() {
         rateLimiter
     });
     await seedRateLimiter(client, rateLimiter, config);
-    if (config.dryRun) {
-        core.info('Running in dry-run mode — no uploads and no deletions will be performed.');
-    }
     let uploadResult;
     let pruneResult;
+    const startedAt = Date.now();
     if (config.mode === 'upload' || config.mode === 'upload-and-prune') {
+        core.info('');
+        core.info(`== Upload → ${config.remoteDir} ==`);
         const files = await resolveFiles(config.filePatterns);
-        core.info(`Uploading ${files.length} file(s) to ${config.remoteDir}`);
+        core.info(`${files.length} local file(s) matched the configured patterns`);
         uploadResult = await (0, upload_1.runUpload)(client, {
             files,
             remoteDir: config.remoteDir,
@@ -37309,6 +37349,8 @@ async function run() {
         });
     }
     if (config.mode === 'prune' || config.mode === 'upload-and-prune') {
+        core.info('');
+        core.info('== Prune ==');
         const manifests = await loadManifests(config);
         pruneResult = await (0, prune_1.runPrune)(client, {
             prefixes: config.managedPrefixes,
@@ -37324,8 +37366,15 @@ async function run() {
         });
     }
     const rateStats = rateLimiter.stats();
-    core.info(`Made ${rateStats.requests} VirusTotal API request(s)` +
-        (rateStats.waitedMs > 0 ? `, ${Math.round(rateStats.waitedMs / 1000)}s of that waiting on rate limits` : ''));
+    core.info('');
+    core.info('== Done ==');
+    core.info(`${rateStats.requests} VirusTotal API request(s) in ${(0, format_1.formatDuration)(Date.now() - startedAt)}` +
+        (rateStats.waitedMs > 0 ? `, of which ${(0, format_1.formatDuration)(rateStats.waitedMs)} was rate-limit waiting` : ''));
+    const headroom = Object.entries(rateStats.remaining)
+        .map(([window, left]) => `${left} per ${window}`)
+        .join(', ');
+    if (headroom)
+        core.info(`Requests still available: ${headroom}`);
     core.setOutput('api-requests', rateStats.requests);
     setOutputs(uploadResult, pruneResult);
     try {
@@ -37338,6 +37387,36 @@ async function run() {
     if (pruneResult && pruneResult.errors.length > 0) {
         throw new Error(`${pruneResult.errors.length} item(s) failed to delete:\n${pruneResult.errors.join('\n')}`);
     }
+}
+/** States up front what this run will do and under what settings, so the log explains itself. */
+function describeRun(config) {
+    core.info(`VirusTotal Monitor — mode: ${config.mode}${config.dryRun ? ', DRY RUN' : ''}`);
+    if (config.dryRun) {
+        core.info('Dry run: every decision is logged, nothing is uploaded and nothing is deleted.');
+    }
+    if (config.mode !== 'prune') {
+        core.info(`Uploading into ${config.remoteDir}; identical files already there are skipped.`);
+    }
+    if (config.mode !== 'upload') {
+        core.info(`Pruning ${config.managedPrefixes.join(', ')} once usage passes ` +
+            `${(config.highWatermark * 100).toFixed(0)}% of ${(0, format_1.formatBytes)(config.quotaBytes)}, ` +
+            `down to ${(config.targetWatermark * 100).toFixed(0)}%. Keeping the newest ` +
+            `${config.keepVersions} version(s) per prefix plus anything a live manifest references.`);
+    }
+    core.info(`Rate limits: ${describeLimit(config.rateLimits.perMinute, 'minute')}, ` +
+        `${describeLimit(config.rateLimits.perDay, 'day')}, ` +
+        `${describeLimit(config.rateLimits.perMonth, 'month')}. ` +
+        `Failures ${config.onError === 'warn' ? 'warn only' : 'fail the job'}.`);
+    if (config.rateLimits.perMinute > 0 && config.rateLimits.perMinute <= 10) {
+        core.info(`At ${config.rateLimits.perMinute} request(s) per minute expect roughly ` +
+            `${Math.round(60 / config.rateLimits.perMinute)}s between calls, so listing many folders takes a while.`);
+    }
+    if (!verbose) {
+        core.info('Set verbose: true (or ACTIONS_STEP_DEBUG) for per-request logging.');
+    }
+}
+function describeLimit(limit, window) {
+    return limit > 0 ? `${limit}/${window}` : `${window} unlimited`;
 }
 /**
  * Folds VirusTotal's own usage figures into the limiter. Without this the daily and monthly
@@ -37363,8 +37442,11 @@ async function seedRateLimiter(client, rateLimiter, config) {
 }
 async function loadManifests(config) {
     if (config.manifestUrls.length > 0) {
-        core.info(`Reading ${config.manifestUrls.length} channel manifest(s) to determine what is still live`);
-        return (0, manifests_1.fetchManifests)(config.manifestUrls, { logger });
+        core.info(`Fetching ${config.manifestUrls.length} channel manifest(s) from the CDN. Whatever they ` +
+            'reference is never deleted, and a manifest that fails to load aborts the prune.');
+        const index = await (0, manifests_1.fetchManifests)(config.manifestUrls, { logger });
+        core.info(`All ${config.manifestUrls.length} manifest(s) read successfully`);
+        return index;
     }
     // Deleting without knowing what the channels point at is the one mistake we cannot undo.
     if (!config.dryRun) {
@@ -37426,7 +37508,7 @@ async function writeSummary(config, uploadResult, pruneResult) {
                 ],
                 ...[...uploadResult.uploaded, ...uploadResult.skipped].map(entry => [
                     entry.remotePath,
-                    (0, upload_1.formatBytes)(entry.size),
+                    (0, format_1.formatBytes)(entry.size),
                     entry.action
                 ])
             ]);
@@ -37435,13 +37517,13 @@ async function writeSummary(config, uploadResult, pruneResult) {
     if (pruneResult) {
         summary.addHeading('Storage', 3);
         summary.addRaw([
-            `- Usage before: **${(0, upload_1.formatBytes)(pruneResult.usageBytesBefore)}** of ` +
-                `${(0, upload_1.formatBytes)(pruneResult.quotaBytes)} (${(pruneResult.ratioBefore * 100).toFixed(1)}%)`,
+            `- Usage before: **${(0, format_1.formatBytes)(pruneResult.usageBytesBefore)}** of ` +
+                `${(0, format_1.formatBytes)(pruneResult.quotaBytes)} (${(pruneResult.ratioBefore * 100).toFixed(1)}%)`,
             `- High watermark: ${(config.highWatermark * 100).toFixed(0)}% · target ` +
                 `${(config.targetWatermark * 100).toFixed(0)}% · keep ${config.keepVersions} version(s) per prefix`,
             `- Prune triggered: **${pruneResult.triggered ? 'yes' : 'no'}**`,
-            `- ${pruneResult.dryRun ? 'Would free' : 'Freed'}: **${(0, upload_1.formatBytes)(pruneResult.freedBytes)}** ` +
-                `→ ${(0, upload_1.formatBytes)(pruneResult.usageBytesAfter)} (${(pruneResult.ratioAfter * 100).toFixed(1)}%)`
+            `- ${pruneResult.dryRun ? 'Would free' : 'Freed'}: **${(0, format_1.formatBytes)(pruneResult.freedBytes)}** ` +
+                `→ ${(0, format_1.formatBytes)(pruneResult.usageBytesAfter)} (${(pruneResult.ratioAfter * 100).toFixed(1)}%)`
         ].join('\n') + '\n', true);
         if (pruneResult.deleted.length > 0) {
             summary.addHeading(pruneResult.dryRun ? 'Would delete' : 'Deleted', 3);
@@ -37454,12 +37536,12 @@ async function writeSummary(config, uploadResult, pruneResult) {
                 ...pruneResult.deleted.map(group => [
                     group.path,
                     String(group.files.length),
-                    (0, upload_1.formatBytes)(group.sizeBytes)
+                    (0, format_1.formatBytes)(group.sizeBytes)
                 ])
             ]);
         }
         if (pruneResult.shortfallBytes > 0) {
-            summary.addRaw(`\n> Still **${(0, upload_1.formatBytes)(pruneResult.shortfallBytes)}** above target — everything else is protected.\n`, true);
+            summary.addRaw(`\n> Still **${(0, format_1.formatBytes)(pruneResult.shortfallBytes)}** above target — everything else is protected.\n`, true);
         }
     }
     await summary.write();
@@ -37507,7 +37589,11 @@ async function fetchManifests(urls, options = {}) {
     if (urls.length === 0)
         return exports.emptyManifestIndex;
     const texts = [];
-    for (const url of urls) {
+    for (const [index, url] of urls.entries()) {
+        // These are CDN fetches, not VirusTotal calls, so they are not rate limited and should be
+        // quick. Numbering them makes it obvious when the slow part is what comes after.
+        logger.info(`  [${index + 1}/${urls.length}] ${url}`);
+        const startedAt = Date.now();
         const response = await requestFn(url, {
             method: 'GET',
             headers: { 'user-agent': 'streamelements-virustotal-monitor-action' },
@@ -37518,7 +37604,9 @@ async function fetchManifests(urls, options = {}) {
         if (response.statusCode < 200 || response.statusCode >= 300) {
             throw new Error(`Failed to fetch manifest ${url}: HTTP ${response.statusCode} ${text.slice(0, 200)}`);
         }
-        logger.debug(`Fetched manifest ${url} (${text.length} bytes)`);
+        const version = /^\s*version_number\s*=\s*(\S+)/im.exec(text)?.[1];
+        logger.info(`      HTTP ${response.statusCode}, ${text.length} bytes, ${Date.now() - startedAt}ms` +
+            `${version ? ` — currently serving version ${version}` : ''}`);
         texts.push(text.toLowerCase());
     }
     return {
@@ -37663,7 +37751,7 @@ exports.runPrune = runPrune;
 const logging_1 = __nccwpck_require__(1338);
 const manifests_1 = __nccwpck_require__(8977);
 const paths_1 = __nccwpck_require__(8431);
-const upload_1 = __nccwpck_require__(1550);
+const format_1 = __nccwpck_require__(6264);
 const version_1 = __nccwpck_require__(311);
 /** Buckets a flat item list into `<prefix>/<version>/` groups — the unit we delete. */
 function buildVersionGroups(items, prefixes) {
@@ -37762,7 +37850,7 @@ async function runPrune(client, options) {
     const { items, usageBytes } = await collectUsage(client, options, logger);
     const groups = buildVersionGroups(items, prefixes);
     const ratioBefore = options.quotaBytes > 0 ? usageBytes / options.quotaBytes : 0;
-    logger.info(`Monitor usage: ${(0, upload_1.formatBytes)(usageBytes)} of ${(0, upload_1.formatBytes)(options.quotaBytes)} ` +
+    logger.info(`Monitor usage: ${(0, format_1.formatBytes)(usageBytes)} of ${(0, format_1.formatBytes)(options.quotaBytes)} ` +
         `(${(ratioBefore * 100).toFixed(1)}%), high watermark ${(options.highWatermark * 100).toFixed(0)}%`);
     logger.info(`Found ${groups.length} managed version folder(s) under ${prefixes.join(', ')}`);
     const decisions = decideRetention(groups, {
@@ -37793,20 +37881,20 @@ async function runPrune(client, options) {
     }
     const targetBytes = options.quotaBytes * options.targetWatermark;
     const bytesToFree = Math.max(0, usageBytes - targetBytes);
-    logger.info(`Need to free ${(0, upload_1.formatBytes)(bytesToFree)} to reach the ` +
-        `${(options.targetWatermark * 100).toFixed(0)}% target (${(0, upload_1.formatBytes)(targetBytes)})`);
+    logger.info(`Need to free ${(0, format_1.formatBytes)(bytesToFree)} to reach the ` +
+        `${(options.targetWatermark * 100).toFixed(0)}% target (${(0, format_1.formatBytes)(targetBytes)})`);
     const candidates = sortOldestFirst(decisions.filter(decision => !decision.keep).map(decision => decision.group));
     let freed = 0;
     for (const group of candidates) {
         if (freed >= bytesToFree)
             break;
         if (options.dryRun) {
-            logger.info(`[dry-run] Would delete ${group.path} (${group.files.length} file(s), ${(0, upload_1.formatBytes)(group.sizeBytes)})`);
+            logger.info(`[dry-run] Would delete ${group.path} (${group.files.length} file(s), ${(0, format_1.formatBytes)(group.sizeBytes)})`);
             result.deleted.push(group);
             freed += group.sizeBytes;
             continue;
         }
-        logger.info(`Deleting ${group.path} (${group.files.length} file(s), ${(0, upload_1.formatBytes)(group.sizeBytes)})`);
+        logger.info(`Deleting ${group.path} (${group.files.length} file(s), ${(0, format_1.formatBytes)(group.sizeBytes)})`);
         const deletedGroup = await deleteGroup(client, group, logger, result.errors);
         result.deleted.push(group);
         freed += deletedGroup;
@@ -37816,12 +37904,12 @@ async function runPrune(client, options) {
     result.ratioAfter = options.quotaBytes > 0 ? result.usageBytesAfter / options.quotaBytes : 0;
     result.shortfallBytes = Math.max(0, bytesToFree - freed);
     if (result.shortfallBytes > 0) {
-        logger.warning(`Could not reach the target watermark: ${(0, upload_1.formatBytes)(result.shortfallBytes)} still over. ` +
+        logger.warning(`Could not reach the target watermark: ${(0, format_1.formatBytes)(result.shortfallBytes)} still over. ` +
             'Everything else is protected by the retention policy (manifest-referenced, pinned, or one of the ' +
             `${options.keepVersions} most recent versions).`);
     }
-    logger.info(`${options.dryRun ? '[dry-run] Would free' : 'Freed'} ${(0, upload_1.formatBytes)(freed)} — ` +
-        `usage now ${(0, upload_1.formatBytes)(result.usageBytesAfter)} (${(result.ratioAfter * 100).toFixed(1)}%)`);
+    logger.info(`${options.dryRun ? '[dry-run] Would free' : 'Freed'} ${(0, format_1.formatBytes)(freed)} — ` +
+        `usage now ${(0, format_1.formatBytes)(result.usageBytesAfter)} (${(result.ratioAfter * 100).toFixed(1)}%)`);
     return result;
 }
 /** Deletes a version's files (then its folders) and returns the bytes actually freed. */
@@ -37859,7 +37947,7 @@ async function collectUsage(client, options, logger) {
         if (!stats) {
             throw new Error('Monitor returned no statistics; use usage-source: walk to measure storage directly.');
         }
-        logger.info(`Storage from /monitor/statistics: ${(0, upload_1.formatBytes)(stats.storageBytesCount)} across ` +
+        logger.info(`Storage from /monitor/statistics: ${(0, format_1.formatBytes)(stats.storageBytesCount)} across ` +
             `${stats.storageFilesCount} file(s), as of ${new Date(stats.date * 1000).toISOString()}`);
         const items = dedupe((await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat());
         return { items, usageBytes: stats.storageBytesCount };
@@ -37868,9 +37956,17 @@ async function collectUsage(client, options, logger) {
     // items under the managed prefixes are prunable. The managed prefixes are then walked
     // directly and merged in: a root listing that does not expose the intermediate folders
     // would otherwise report zero usage and silently disable pruning.
+    logger.info('Enumerating existing items in VirusTotal Monitor storage to measure usage. Monitor has no ' +
+        'recursive listing, so this is one request per folder and is usually the slowest part of the run.');
+    const startedAt = Date.now();
+    logger.info('Walking the Monitor root (/) for account-wide usage');
     const fromRoot = await client.walk('/');
+    logger.info(`Walking the managed prefix(es): ${options.prefixes.join(', ')}`);
     const fromPrefixes = (await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat();
     const items = dedupe([...fromRoot, ...fromPrefixes]);
+    const fileCount = items.filter(item => item.itemType === 'file').length;
+    logger.info(`Enumerated ${items.length} item(s) — ${fileCount} file(s), ` +
+        `${items.length - fileCount} folder(s) — in ${(0, format_1.formatDuration)(Date.now() - startedAt)}`);
     const usageBytes = items
         .filter(item => item.itemType === 'file')
         .reduce((total, item) => total + item.size, 0);
@@ -37879,7 +37975,7 @@ async function collectUsage(client, options, logger) {
         .filter(item => !options.prefixes.some(prefix => (0, paths_1.isUnder)(item.path, prefix)))
         .reduce((total, item) => total + item.size, 0);
     if (unmanaged > 0) {
-        logger.info(`${(0, upload_1.formatBytes)(unmanaged)} sits outside the managed prefixes and will never be pruned.`);
+        logger.info(`${(0, format_1.formatBytes)(unmanaged)} sits outside the managed prefixes and will never be pruned.`);
     }
     return { items, usageBytes };
 }
@@ -37923,6 +38019,8 @@ exports.DEFAULT_RATE_LIMITS = {
     perMonth: 15500,
     maxWaitMs: 5 * exports.MINUTE_MS
 };
+/** Waits at least this long are surfaced at info level rather than debug. */
+const NOTICEABLE_WAIT_MS = 2000;
 class RateLimitExceededError extends Error {
     constructor(message) {
         super(message);
@@ -37976,7 +38074,8 @@ class RateLimiter {
                     throw new RateLimitExceededError(`VirusTotal returned 429 and asked to wait ${Math.round(waitMs / 1000)}s, beyond the ` +
                         `${Math.round(this.maxWaitMs / 1000)}s cap set by rate-limit-max-wait.`);
                 }
-                this.logger.debug(`Holding ${Math.round(waitMs / 1000)}s after a 429 from VirusTotal`);
+                this.report(waitMs, `Holding all VirusTotal calls for ${Math.round(waitMs / 1000)}s after a 429 — the key's real ` +
+                    'limits are tighter than the configured ones.');
                 this.waitedMs += waitMs;
                 await this.sleep(waitMs);
                 continue;
@@ -38003,7 +38102,12 @@ class RateLimiter {
                     `${Math.round(this.maxWaitMs / 1000)}s cap. Raise rate-limit-per-minute if the key allows ` +
                     'a higher rate, or rate-limit-max-wait to allow a longer pause.');
             }
-            this.logger.debug(`Rate limit reached (${blocked.map(w => w.name).join(', ')}) — waiting ${Math.round(waitMs / 1000)}s`);
+            // A silent pause reads as a hung job, so anything the user would notice is said out loud.
+            const window = blocked[0];
+            const detail = `${window.limit} request(s) per ${window.name}` +
+                (window.spent > 0 ? `, ${window.spent} of them already used before this run` : '');
+            this.report(waitMs, `Pausing ${Math.round(waitMs / 1000)}s to stay within VirusTotal's rate limit — ${detail}. ` +
+                `Raise rate-limit-per-${window.name} if the key allows a higher rate.`);
             this.waitedMs += waitMs;
             await this.sleep(waitMs);
         }
@@ -38016,6 +38120,16 @@ class RateLimiter {
             remaining[window.name] = Math.max(0, window.limit - this.used(window, now));
         }
         return { requests: this.history.length, waitedMs: this.waitedMs, remaining };
+    }
+    /**
+     * A pause long enough to notice is announced at info level; sub-second ones stay in debug so
+     * a fast run is not drowned in noise.
+     */
+    report(waitMs, message) {
+        if (waitMs >= NOTICEABLE_WAIT_MS)
+            this.logger.info(message);
+        else
+            this.logger.debug(message);
     }
     used(window, now) {
         const cutoff = now - window.spanMs;
@@ -38051,8 +38165,8 @@ exports.RateLimiter = RateLimiter;
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.planUpload = planUpload;
 exports.runUpload = runUpload;
-exports.formatBytes = formatBytes;
 const promises_1 = __nccwpck_require__(1455);
+const format_1 = __nccwpck_require__(6264);
 const hash_1 = __nccwpck_require__(6495);
 const logging_1 = __nccwpck_require__(1338);
 const paths_1 = __nccwpck_require__(8431);
@@ -38072,18 +38186,30 @@ async function planUpload(client, options) {
             throw new Error(`Not a file: ${localPath}`);
         }
         const remotePath = (0, paths_1.joinPath)(remoteDir, (0, paths_1.basename)(localPath));
+        // Hashing is what makes a re-run idempotent: identical bytes are never uploaded twice.
+        logger.debug(`Hashing ${localPath} (${(0, format_1.formatBytes)(stats.size)}) to compare against Monitor`);
         const sha256 = await (0, hash_1.sha256File)(localPath);
+        logger.debug(`  sha256 ${sha256}`);
         const match = existing.get(remotePath);
         if (!match) {
+            logger.debug(`  ${remotePath} is not in Monitor yet — will upload`);
             plan.push({ localPath, remotePath, size: stats.size, sha256, action: 'create' });
         }
         else if (match.sha256 && match.sha256.toLowerCase() === sha256) {
+            logger.debug(`  ${remotePath} already holds these exact bytes — will skip`);
             plan.push({ localPath, remotePath, size: stats.size, sha256, action: 'skip', existingItemId: match.id });
         }
         else {
+            logger.debug(`  ${remotePath} exists with a different sha256 (${match.sha256 ?? 'unknown'}) — ` +
+                'will overwrite that item in place rather than create a second copy');
             plan.push({ localPath, remotePath, size: stats.size, sha256, action: 'overwrite', existingItemId: match.id });
         }
     }
+    const counts = plan.reduce((acc, entry) => {
+        acc[entry.action] = (acc[entry.action] ?? 0) + 1;
+        return acc;
+    }, {});
+    logger.info(`Plan: ${counts.create ?? 0} to upload, ${counts.overwrite ?? 0} to overwrite, ${counts.skip ?? 0} unchanged`);
     return plan;
 }
 async function runUpload(client, options) {
@@ -38100,12 +38226,12 @@ async function runUpload(client, options) {
         }
         const verb = entry.action === 'overwrite' ? 'Overwriting' : 'Uploading';
         if (options.dryRun) {
-            logger.info(`[dry-run] ${verb} ${entry.remotePath} (${formatBytes(entry.size)})`);
+            logger.info(`[dry-run] ${verb} ${entry.remotePath} (${(0, format_1.formatBytes)(entry.size)})`);
             uploaded.push(entry);
             bytesUploaded += entry.size;
             continue;
         }
-        logger.info(`${verb} ${entry.remotePath} (${formatBytes(entry.size)})`);
+        logger.info(`${verb} ${entry.remotePath} (${(0, format_1.formatBytes)(entry.size)})`);
         const id = await client.uploadFile({
             localPath: entry.localPath,
             remotePath: entry.remotePath,
@@ -38120,11 +38246,13 @@ async function runUpload(client, options) {
 }
 async function listExisting(client, remoteDir, logger) {
     const byPath = new Map();
+    logger.info(`Checking what ${remoteDir} already holds, so a re-run does not duplicate items`);
     try {
         for (const item of await client.listFolder(remoteDir)) {
             if (item.itemType === 'file')
                 byPath.set(item.path, item);
         }
+        logger.info(`  ${byPath.size} file(s) already present`);
     }
     catch (error) {
         // A first-ever upload for this version has no folder yet; Monitor answers 404.
@@ -38135,16 +38263,6 @@ async function listExisting(client, remoteDir, logger) {
         throw error;
     }
     return byPath;
-}
-function formatBytes(bytes) {
-    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1024 && unit < units.length - 1) {
-        value /= 1024;
-        unit++;
-    }
-    return `${unit === 0 ? value : value.toFixed(2)} ${units[unit]}`;
 }
 
 
@@ -38230,9 +38348,11 @@ function versionSpellings(version) {
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.MonitorClient = exports.MonitorApiError = exports.DIRECT_UPLOAD_LIMIT_BYTES = exports.DEFAULT_API_URL = void 0;
+exports.formatHeaders = formatHeaders;
 exports.parseRetryAfter = parseRetryAfter;
 const node_fs_1 = __nccwpck_require__(3024);
 const undici_1 = __nccwpck_require__(6752);
+const format_1 = __nccwpck_require__(6264);
 const logging_1 = __nccwpck_require__(1338);
 const multipart_1 = __nccwpck_require__(2039);
 const paths_1 = __nccwpck_require__(8431);
@@ -38326,9 +38446,14 @@ class MonitorClient {
         const collected = [];
         const queue = [(0, paths_1.normalizePath)(rootPath)];
         const visitedFolders = new Set(queue);
+        let listed = 0;
         while (queue.length > 0) {
             const folder = queue.shift();
-            this.logger.debug(`Listing ${(0, paths_1.asFolderPath)(folder)}`);
+            listed++;
+            // Monitor has no recursive listing, so this is one request per folder — and at the default
+            // rate limit that is ~15s each. Report progress at info level or the job looks stalled.
+            this.logger.info(`Listing ${(0, paths_1.asFolderPath)(folder)} — folder ${listed}` +
+                `${queue.length > 0 ? ` of ${listed + queue.length} known so far` : ''}, ${collected.length} item(s) found`);
             for (const item of await this.listFolder(folder)) {
                 if (seen.has(item.id))
                     continue;
@@ -38344,6 +38469,16 @@ class MonitorClient {
     }
     async deleteItem(id) {
         await this.json('DELETE', `/monitor/items/${encodeURIComponent(id)}`);
+    }
+    /**
+     * Strips the API key out of anything about to be logged or thrown. The key appears in the
+     * path of /users/{key}/overall_quotas, so a plain URL is enough to leak it. `core.setSecret`
+     * would mask it on a runner, but a credential should not be written out and then masked.
+     */
+    redact(text) {
+        if (!this.apiKey)
+            return text;
+        return text.split(this.apiKey).join('***').split(encodeURIComponent(this.apiKey)).join('***');
     }
     /** Most recent daily storage snapshot, or undefined when Monitor has no statistics yet. */
     async getStatistics() {
@@ -38418,7 +38553,7 @@ class MonitorClient {
         for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
             if (attempt > 0) {
                 const delay = retryDelayMs ?? this.retryBaseMs * 2 ** (attempt - 1);
-                this.logger.debug(`Retry ${attempt}/${this.maxRetries} for ${options.method} ${options.url} in ${delay}ms`);
+                this.logger.debug(`Retry ${attempt}/${this.maxRetries} for ${options.method} ${this.redact(options.url)} in ${delay}ms`);
                 await this.sleepFn(delay);
             }
             retryDelayMs = undefined;
@@ -38426,6 +38561,11 @@ class MonitorClient {
             if (this.rateLimiter)
                 await this.rateLimiter.acquire();
             const url = options.resolveUrl ? await options.resolveUrl() : options.url;
+            const startedAt = Date.now();
+            const safeUrl = this.redact(url);
+            const attemptOf = attempt > 0 ? ` (attempt ${attempt + 1} of ${this.maxRetries + 1})` : '';
+            const bodySize = options.headers?.['content-length'];
+            this.logger.debug(`→ ${options.method} ${safeUrl}${bodySize ? ` [${(0, format_1.formatBytes)(Number(bodySize))} body]` : ''}${attemptOf}`);
             try {
                 const response = await this.requestFn(url, {
                     method: options.method,
@@ -38440,10 +38580,13 @@ class MonitorClient {
                     headersTimeout: options.headersTimeoutMs ?? 60_000
                 });
                 const text = await response.body.text();
+                this.logger.debug(`← ${response.statusCode} in ${Date.now() - startedAt}ms, ${text.length} byte(s) of body`);
+                // Response headers only. Request headers carry x-apikey and are never logged.
+                this.logger.debug(`  headers: ${formatHeaders(response.headers)}`);
                 if (response.statusCode >= 200 && response.statusCode < 300) {
                     return (text.length > 0 ? JSON.parse(text) : {});
                 }
-                const error = toApiError(response.statusCode, text, options.method, url);
+                const error = toApiError(response.statusCode, text, options.method, safeUrl);
                 if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === this.maxRetries) {
                     throw error;
                 }
@@ -38475,14 +38618,31 @@ class MonitorClient {
                 const error = caught instanceof Error ? caught : new Error(String(caught));
                 if (attempt === this.maxRetries)
                     throw error;
-                this.logger.warning(`${options.method} ${url} failed: ${error.message} — retrying`);
+                this.logger.warning(`${options.method} ${safeUrl} failed: ${this.redact(error.message)} — retrying`);
                 lastError = error;
             }
         }
-        throw lastError ?? new Error(`${options.method} ${options.url} failed`);
+        throw lastError ?? new Error(`${options.method} ${this.redact(options.url)} failed`);
     }
 }
 exports.MonitorClient = MonitorClient;
+/**
+ * Renders response headers for the debug log. Only ever called with *response* headers —
+ * request headers carry the API key and must not reach the log.
+ */
+function formatHeaders(headers) {
+    if (!headers)
+        return '(none)';
+    const rendered = Object.keys(headers)
+        .sort()
+        // A cookie is of no diagnostic use here and is the one response header worth not printing.
+        .filter(name => name.toLowerCase() !== 'set-cookie')
+        .map(name => {
+        const value = headers[name];
+        return `${name}=${Array.isArray(value) ? value.join(',') : value}`;
+    });
+    return rendered.length > 0 ? rendered.join(' ') : '(none)';
+}
 /** `Retry-After` is either a delay in seconds or an HTTP date. Capped so a bad value can't stall a job. */
 function parseRetryAfter(headers, now = Date.now()) {
     const raw = headers?.['retry-after'];

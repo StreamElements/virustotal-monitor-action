@@ -205,6 +205,52 @@ describe('the 429 penalty', () => {
   })
 })
 
+describe('how waits are reported', () => {
+  function capturing() {
+    const debug: string[] = []
+    const info: string[] = []
+    return { debug: (m: string) => debug.push(m), info: (m: string) => info.push(m), warning: () => undefined, lines: { debug, info } }
+  }
+
+  it('announces a noticeable pause at info level, with the reason and the fix', async () => {
+    const time = clock()
+    const logger = capturing()
+    const limiter = new RateLimiter(limits({ perMinute: 1 }), { ...time, logger })
+
+    await limiter.acquire()
+    await limiter.acquire()
+
+    expect(logger.lines.info).toHaveLength(1)
+    expect(logger.lines.info[0]).toContain('Pausing 60s to stay within VirusTotal')
+    expect(logger.lines.info[0]).toContain('1 request(s) per minute')
+    expect(logger.lines.info[0]).toContain('Raise rate-limit-per-minute')
+  })
+
+  it('mentions quota already spent before the run, which is otherwise baffling', async () => {
+    const time = clock()
+    const logger = capturing()
+    const limiter = new RateLimiter(limits({ perMinute: 0, perDay: 3, maxWaitMs: DAY_MS }), { ...time, logger })
+    limiter.seed({ day: 2 })
+
+    await limiter.acquire()
+    await limiter.acquire()
+
+    expect(logger.lines.info[0]).toContain('2 of them already used before this run')
+  })
+
+  it('keeps a sub-second pause in debug so a fast run stays quiet', async () => {
+    const time = clock()
+    const logger = capturing()
+    const limiter = new RateLimiter(limits({ perMinute: 100 }), { ...time, logger })
+
+    limiter.penalize(500)
+    await limiter.acquire()
+
+    expect(logger.lines.info).toEqual([])
+    expect(logger.lines.debug).toHaveLength(1)
+  })
+})
+
 describe('stats', () => {
   it('reports requests made, time waited and headroom left', async () => {
     const time = clock()
