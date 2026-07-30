@@ -1,0 +1,44 @@
+# Temporary diagnostic: does the action resolve when the owner is spelled in the wrong case?
+# Both jobs point at the same action; only the casing of the owner differs. A job that fails in
+# "Set up job" could not resolve the reference. The step itself is expected to warn and pass —
+# it talks to a dead local address on purpose, so nothing external is contacted.
+name: Resolve check
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lowercase-owner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: streamelements/... (as the failing workflow spells it)
+        uses: streamelements/virustotal-monitor-action@v1
+        continue-on-error: true
+        with:
+          api-key: not-a-real-key
+          api-url: http://127.0.0.1:9/api/v3
+          mode: prune
+          dry-run: 'true'
+          rate-limit-per-minute: '0'
+          rate-limit-per-day: '0'
+          rate-limit-per-month: '0'
+          on-error: warn
+
+  exact-case-owner:
+    runs-on: ubuntu-latest
+    steps:
+      - name: StreamElements/... (as the repository is actually named)
+        uses: StreamElements/virustotal-monitor-action@v1
+        continue-on-error: true
+        with:
+          api-key: not-a-real-key
+          api-url: http://127.0.0.1:9/api/v3
+          mode: prune
+          dry-run: 'true'
+          rate-limit-per-minute: '0'
+          rate-limit-per-day: '0'
+          rate-limit-per-month: '0'
+          on-error: warn
