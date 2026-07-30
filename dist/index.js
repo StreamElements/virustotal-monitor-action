@@ -37681,7 +37681,8 @@ exports.joinPath = joinPath;
 exports.basename = basename;
 exports.dirname = dirname;
 exports.isUnder = isUnder;
-exports.segmentUnder = segmentUnder;
+exports.topLevelUnder = topLevelUnder;
+exports.looksLikeVersion = looksLikeVersion;
 /** `obs-streamelements//windows/` -> `/obs-streamelements/windows` (no trailing slash). */
 function normalizePath(input) {
     const collapsed = input.replace(/\\/g, '/').replace(/\/+/g, '/');
@@ -37721,18 +37722,30 @@ function isUnder(child, parent) {
     return normalizePath(child).startsWith(`${normalizedParent}/`);
 }
 /**
- * The first path segment below `prefix`, i.e. the version folder name.
- * Returns undefined for files sitting directly in the prefix — those are never pruned.
+ * The first path segment below `prefix`, whether or not anything lives beneath it.
+ *
+ * `/p/w/20260729000746/setup.exe` and `/p/w/20260729000746` both yield `20260729000746`, and a
+ * loose `/p/w/README.txt` yields `README.txt`. Everything directly under a managed prefix is a
+ * prune candidate, not only paths that follow the version convention — an unrecognised folder
+ * still consumes the storage quota.
  */
-function segmentUnder(child, prefix) {
+function topLevelUnder(child, prefix) {
     if (!isUnder(child, prefix))
         return undefined;
     const normalizedPrefix = normalizePath(prefix);
     const rest = normalizePath(child).slice(normalizedPrefix === '/' ? 1 : normalizedPrefix.length + 1);
-    const [segment, ...tail] = rest.split('/');
-    if (!segment || tail.length === 0)
-        return undefined;
-    return segment;
+    const [segment] = rest.split('/');
+    return segment || undefined;
+}
+/**
+ * Whether a name looks like a release version: digits, optionally separated. Matches both
+ * spellings SE.Live uses — `20260729000746` and `26.7.29.746` — and nothing else.
+ *
+ * This decides ordering, not eligibility. Names that are not versions are purged first, since
+ * they are not part of the release history that the keep-newest-N rule exists to protect.
+ */
+function looksLikeVersion(name) {
+    return /^\d+([._-]\d+)*$/.test(name);
 }
 
 
@@ -37744,7 +37757,7 @@ function segmentUnder(child, prefix) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.buildVersionGroups = buildVersionGroups;
+exports.buildPruneGroups = buildPruneGroups;
 exports.sortOldestFirst = sortOldestFirst;
 exports.decideRetention = decideRetention;
 exports.runPrune = runPrune;
@@ -37753,22 +37766,29 @@ const manifests_1 = __nccwpck_require__(8977);
 const paths_1 = __nccwpck_require__(8431);
 const format_1 = __nccwpck_require__(6264);
 const version_1 = __nccwpck_require__(311);
-/** Buckets a flat item list into `<prefix>/<version>/` groups — the unit we delete. */
-function buildVersionGroups(items, prefixes) {
+/**
+ * Buckets a flat item list by top-level entry under each managed prefix — the unit we delete.
+ *
+ * Every entry counts, not only `<prefix>/<version>/` folders: a stray folder or a loose file
+ * consumes the same quota, and leaving it unreachable by prune is how storage fills up with
+ * things nobody can name. What survives is decided by the retention filters below.
+ */
+function buildPruneGroups(items, prefixes) {
     const normalizedPrefixes = prefixes.map(paths_1.normalizePath);
     const groups = new Map();
     for (const item of items) {
         for (const prefix of normalizedPrefixes) {
-            const version = (0, paths_1.segmentUnder)(item.path, prefix);
-            if (!version)
+            const name = (0, paths_1.topLevelUnder)(item.path, prefix);
+            if (!name)
                 continue;
-            const key = `${prefix}/${version}`;
+            const key = `${prefix}/${name}`;
             let group = groups.get(key);
             if (!group) {
                 group = {
                     prefix,
-                    version,
-                    path: (0, paths_1.joinPath)(prefix, version),
+                    name,
+                    path: (0, paths_1.joinPath)(prefix, name),
+                    versionLike: (0, paths_1.looksLikeVersion)(name),
                     files: [],
                     folders: [],
                     sizeBytes: 0,
@@ -37776,6 +37796,7 @@ function buildVersionGroups(items, prefixes) {
                 };
                 groups.set(key, group);
             }
+            // A folder entry and its contents both land here; so does a loose file, as its own group.
             if (item.itemType === 'folder') {
                 group.folders.push(item);
             }
@@ -37789,21 +37810,23 @@ function buildVersionGroups(items, prefixes) {
             break;
         }
     }
-    // The version folder itself is a child of the prefix, so `segmentUnder` skips it; pick it up here.
-    for (const item of items) {
-        if (item.itemType !== 'folder')
-            continue;
-        const group = [...groups.values()].find(candidate => candidate.path === item.path);
-        if (group && !group.folders.some(folder => folder.id === item.id)) {
-            group.folders.push(item);
-        }
-    }
     return [...groups.values()];
 }
 /** Oldest first — the order in which groups become deletion candidates. */
 function sortOldestFirst(groups) {
     return [...groups].sort((a, b) => {
-        const byVersion = (0, version_1.compareVersions)(a.version, b.version);
+        // Entries that are not versions go first. They are not part of the release history the
+        // keep-newest-N rule protects, so they should neither outlive a real release nor occupy a
+        // protection slot that a real release needs.
+        if (a.versionLike !== b.versionLike)
+            return a.versionLike ? 1 : -1;
+        if (!a.versionLike) {
+            // Nothing meaningful to compare in the names, so fall back to when they appeared.
+            if (a.creationDate !== b.creationDate)
+                return a.creationDate - b.creationDate;
+            return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+        }
+        const byVersion = (0, version_1.compareVersions)(a.name, b.name);
         if (byVersion !== 0)
             return byVersion;
         return a.creationDate - b.creationDate;
@@ -37830,11 +37853,11 @@ function decideRetention(groups, options) {
     }
     const pinned = new Set(options.pinnedVersions.flatMap(version => (0, version_1.versionSpellings)(version)));
     return groups.map(group => {
-        const tokens = [...(0, version_1.versionSpellings)(group.version), ...group.files.map(file => (0, paths_1.basename)(file.path))];
+        const tokens = [...(0, version_1.versionSpellings)(group.name), ...group.files.map(file => (0, paths_1.basename)(file.path))];
         if (options.manifests.references(tokens)) {
             return { group, keep: true, reason: 'manifest' };
         }
-        if ((0, version_1.versionSpellings)(group.version).some(spelling => pinned.has(spelling))) {
+        if ((0, version_1.versionSpellings)(group.name).some(spelling => pinned.has(spelling))) {
             return { group, keep: true, reason: 'pinned' };
         }
         if (recent.has(group.path)) {
@@ -37848,11 +37871,20 @@ async function runPrune(client, options) {
     const manifests = options.manifests ?? manifests_1.emptyManifestIndex;
     const prefixes = options.prefixes.map(paths_1.normalizePath);
     const { items, usageBytes } = await collectUsage(client, options, logger);
-    const groups = buildVersionGroups(items, prefixes);
+    const groups = buildPruneGroups(items, prefixes);
     const ratioBefore = options.quotaBytes > 0 ? usageBytes / options.quotaBytes : 0;
     logger.info(`Monitor usage: ${(0, format_1.formatBytes)(usageBytes)} of ${(0, format_1.formatBytes)(options.quotaBytes)} ` +
         `(${(ratioBefore * 100).toFixed(1)}%), high watermark ${(options.highWatermark * 100).toFixed(0)}%`);
-    logger.info(`Found ${groups.length} managed version folder(s) under ${prefixes.join(', ')}`);
+    const unrecognised = groups.filter(group => !group.versionLike);
+    logger.info(`Found ${groups.length} prunable entr(y/ies) under ${prefixes.join(', ')} — ` +
+        `${groups.length - unrecognised.length} release version(s)` +
+        `${unrecognised.length > 0 ? `, ${unrecognised.length} not matching the version convention` : ''}`);
+    if (unrecognised.length > 0) {
+        logger.info(`Entries that are not release versions are considered first, and are purged unless a ` +
+            `manifest references them or they are pinned: ${unrecognised
+                .map(group => `${group.name} (${(0, format_1.formatBytes)(group.sizeBytes)})`)
+                .join(', ')}`);
+    }
     const decisions = decideRetention(groups, {
         keepVersions: options.keepVersions,
         manifests,
@@ -37888,13 +37920,15 @@ async function runPrune(client, options) {
     for (const group of candidates) {
         if (freed >= bytesToFree)
             break;
+        const what = `${group.path} (${group.files.length} file(s), ${(0, format_1.formatBytes)(group.sizeBytes)}` +
+            `${group.versionLike ? '' : ', not a release version'})`;
         if (options.dryRun) {
-            logger.info(`[dry-run] Would delete ${group.path} (${group.files.length} file(s), ${(0, format_1.formatBytes)(group.sizeBytes)})`);
+            logger.info(`[dry-run] Would delete ${what}`);
             result.deleted.push(group);
             freed += group.sizeBytes;
             continue;
         }
-        logger.info(`Deleting ${group.path} (${group.files.length} file(s), ${(0, format_1.formatBytes)(group.sizeBytes)})`);
+        logger.info(`Deleting ${what}`);
         const deletedGroup = await deleteGroup(client, group, logger, result.errors);
         result.deleted.push(group);
         freed += deletedGroup;

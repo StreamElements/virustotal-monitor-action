@@ -270,6 +270,49 @@ async function main(port) {
   check('exit 0', run.exitCode === 0, run.exitCode)
   check('warned instead of failing', /::warning::/.test(run.stdout), run.stdout.slice(0, 300))
 
+  console.log('--- prune reaches entries that do not follow the version convention ---')
+  // A stray folder and a loose file occupy quota just like a release folder does.
+  state.items.push(
+    {
+      id: 'folder:scratch',
+      type: 'monitor_item',
+      attributes: { path: `${PREFIX}/scratch`, item_type: 'folder', size: 0, creation_date: 900 }
+    },
+    {
+      id: 'file:scratch',
+      type: 'monitor_item',
+      attributes: { path: `${PREFIX}/scratch/x.exe`, item_type: 'file', size: 60, creation_date: 900 }
+    },
+    {
+      id: 'file:leftover',
+      type: 'monitor_item',
+      attributes: { path: `${PREFIX}/leftover.bin`, item_type: 'file', size: 40, creation_date: 901 }
+    }
+  )
+  run = await runAction({ ...pruneInputs, 'dry-run': 'true' })
+  check(
+    'purges the strays first, then the oldest unprotected releases',
+    run.outputs['deleted-versions'] ===
+      JSON.stringify([
+        `${PREFIX}/scratch`,
+        `${PREFIX}/leftover.bin`,
+        `${PREFIX}/20260101000001`,
+        `${PREFIX}/20260103000003`
+      ]),
+    run.outputs['deleted-versions']
+  )
+  check(
+    'says which entries are not release versions',
+    /2 not matching the version convention/.test(run.stdout),
+    run.stdout.slice(0, 400)
+  )
+  check(
+    'still protects the manifest-referenced release',
+    !String(run.outputs['deleted-versions']).includes('20260102000002'),
+    run.outputs['deleted-versions']
+  )
+  state.items = state.items.filter(item => !['folder:scratch', 'file:scratch', 'file:leftover'].includes(item.id))
+
   console.log('--- upload survives an HTTP 429 ---')
   state.uploads = []
   state.rateLimitNextUpload = true

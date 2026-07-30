@@ -1,5 +1,5 @@
 import { ManifestIndex } from '../src/manifests'
-import { buildVersionGroups, decideRetention, runPrune, sortOldestFirst } from '../src/prune'
+import { buildPruneGroups, decideRetention, runPrune, sortOldestFirst } from '../src/prune'
 import { MonitorItem } from '../src/types'
 import { MonitorClient } from '../src/vt-client'
 
@@ -54,9 +54,9 @@ const baseOptions = {
   usageSource: 'walk' as const
 }
 
-describe('buildVersionGroups', () => {
+describe('buildPruneGroups', () => {
   it('groups files and the version folder under one entry per version', () => {
-    const groups = buildVersionGroups(itemsFor(['20260101000001']), [PREFIX])
+    const groups = buildPruneGroups(itemsFor(['20260101000001']), [PREFIX])
 
     expect(groups).toHaveLength(1)
     expect(groups[0].path).toBe(`${PREFIX}/20260101000001`)
@@ -66,28 +66,75 @@ describe('buildVersionGroups', () => {
     expect(groups[0].creationDate).toBe(1000)
   })
 
-  it('ignores items outside the managed prefixes and loose files in the prefix root', () => {
+  it('ignores items outside the managed prefixes', () => {
     const items: MonitorItem[] = [
       ...itemsFor(['20260101000001']),
-      { id: 'other', path: '/somewhere/else/x.exe', itemType: 'file', size: 999 },
-      { id: 'loose', path: `${PREFIX}/README.txt`, itemType: 'file', size: 5 }
+      { id: 'other', path: '/somewhere/else/x.exe', itemType: 'file', size: 999 }
     ]
 
-    const groups = buildVersionGroups(items, [PREFIX])
+    const groups = buildPruneGroups(items, [PREFIX])
     expect(groups).toHaveLength(1)
     expect(groups[0].sizeBytes).toBe(200)
+  })
+
+  it('treats a loose file in the prefix root as its own prunable entry', () => {
+    // It occupies quota like anything else, so prune has to be able to reach it.
+    const items: MonitorItem[] = [
+      ...itemsFor(['20260101000001']),
+      { id: 'loose', path: `${PREFIX}/README.txt`, itemType: 'file', size: 5, creationDate: 900 }
+    ]
+
+    const groups = buildPruneGroups(items, [PREFIX])
+    const loose = groups.find(group => group.name === 'README.txt')
+
+    expect(loose).toBeDefined()
+    expect(loose?.versionLike).toBe(false)
+    expect(loose?.path).toBe(`${PREFIX}/README.txt`)
+    expect(loose?.sizeBytes).toBe(5)
+  })
+
+  it('groups a folder that does not follow the version convention with its contents', () => {
+    const items: MonitorItem[] = [
+      { id: 'f:scratch', path: `${PREFIX}/scratch`, itemType: 'folder', size: 0, creationDate: 900 },
+      { id: 'a', path: `${PREFIX}/scratch/one.exe`, itemType: 'file', size: 70, creationDate: 900 },
+      { id: 'b', path: `${PREFIX}/scratch/nested/two.exe`, itemType: 'file', size: 30, creationDate: 901 }
+    ]
+
+    const groups = buildPruneGroups(items, [PREFIX])
+
+    expect(groups).toHaveLength(1)
+    expect(groups[0].name).toBe('scratch')
+    expect(groups[0].versionLike).toBe(false)
+    expect(groups[0].files).toHaveLength(2)
+    expect(groups[0].sizeBytes).toBe(100)
+    expect(groups[0].folders.map(f => f.id)).toEqual(['f:scratch'])
   })
 })
 
 describe('sortOldestFirst', () => {
   it('orders by version, oldest first', () => {
-    const groups = buildVersionGroups(itemsFor([...VERSIONS].reverse()), [PREFIX])
-    expect(sortOldestFirst(groups).map(g => g.version)).toEqual(VERSIONS)
+    const groups = buildPruneGroups(itemsFor([...VERSIONS].reverse()), [PREFIX])
+    expect(sortOldestFirst(groups).map(g => g.name)).toEqual(VERSIONS)
+  })
+
+  it('puts entries that are not versions ahead of every release', () => {
+    // They are not part of the release history, so they should go before the oldest release
+    // rather than sorting alphabetically among them.
+    const items: MonitorItem[] = [
+      ...itemsFor(VERSIONS.slice(0, 2)),
+      { id: 'loose', path: `${PREFIX}/README.txt`, itemType: 'file', size: 5, creationDate: 5000 },
+      { id: 'junk', path: `${PREFIX}/scratch/x.exe`, itemType: 'file', size: 5, creationDate: 4000 }
+    ]
+
+    const ordered = sortOldestFirst(buildPruneGroups(items, [PREFIX])).map(g => g.name)
+
+    // Non-versions first, by creation date; releases after, by version.
+    expect(ordered).toEqual(['scratch', 'README.txt', '20260101000001', '20260102000002'])
   })
 })
 
 describe('decideRetention', () => {
-  const groups = buildVersionGroups(itemsFor(VERSIONS), [PREFIX])
+  const groups = buildPruneGroups(itemsFor(VERSIONS), [PREFIX])
 
   it('keeps the newest N versions per prefix', () => {
     const decisions = decideRetention(groups, {
@@ -95,7 +142,7 @@ describe('decideRetention', () => {
       manifests: manifestsMentioning(),
       pinnedVersions: []
     })
-    const kept = decisions.filter(d => d.keep).map(d => d.group.version)
+    const kept = decisions.filter(d => d.keep).map(d => d.group.name)
     expect(kept).toEqual(['20260104000004', '20260105000005'])
     expect(decisions.filter(d => d.keep).every(d => d.reason === 'recent')).toBe(true)
   })
@@ -106,9 +153,43 @@ describe('decideRetention', () => {
     )
     const decisions = decideRetention(groups, { keepVersions: 0, manifests, pinnedVersions: [] })
 
-    const oldest = decisions.find(d => d.group.version === '20260101000001')
+    const oldest = decisions.find(d => d.group.name === '20260101000001')
     expect(oldest?.keep).toBe(true)
     expect(oldest?.reason).toBe('manifest')
+  })
+
+  it('does not let stray entries occupy the keep-newest-N slots', () => {
+    // The whole point of keep-versions is protecting recent releases; junk must not crowd them
+    // out and get a real release deleted in its place.
+    const items: MonitorItem[] = [
+      ...itemsFor(VERSIONS.slice(0, 3)),
+      { id: 'j1', path: `${PREFIX}/scratch/x.exe`, itemType: 'file', size: 5, creationDate: 9000 },
+      { id: 'j2', path: `${PREFIX}/tmp.bin`, itemType: 'file', size: 5, creationDate: 9001 }
+    ]
+    const decisions = decideRetention(buildPruneGroups(items, [PREFIX]), {
+      keepVersions: 2,
+      manifests: manifestsMentioning(),
+      pinnedVersions: []
+    })
+
+    const kept = decisions.filter(d => d.keep).map(d => d.group.name)
+    expect(kept).toEqual(['20260102000002', '20260103000003'])
+  })
+
+  it('keeps a stray entry a manifest happens to reference', () => {
+    const items: MonitorItem[] = [
+      ...itemsFor(VERSIONS.slice(0, 1)),
+      { id: 'loose', path: `${PREFIX}/hotfix-installer.exe`, itemType: 'file', size: 5, creationDate: 100 }
+    ]
+    const decisions = decideRetention(buildPruneGroups(items, [PREFIX]), {
+      keepVersions: 0,
+      manifests: manifestsMentioning('package_url=https://cdn/hotfix-installer.exe'),
+      pinnedVersions: []
+    })
+
+    const loose = decisions.find(d => d.group.name === 'hotfix-installer.exe')
+    expect(loose?.keep).toBe(true)
+    expect(loose?.reason).toBe('manifest')
   })
 
   it('keeps explicitly pinned versions', () => {
@@ -118,7 +199,7 @@ describe('decideRetention', () => {
       pinnedVersions: ['20260102000002']
     })
 
-    const pinned = decisions.find(d => d.group.version === '20260102000002')
+    const pinned = decisions.find(d => d.group.name === '20260102000002')
     expect(pinned?.keep).toBe(true)
     expect(pinned?.reason).toBe('pinned')
   })
@@ -142,7 +223,7 @@ describe('runPrune', () => {
     const result = await runPrune(client, { ...baseOptions, manifests: manifestsMentioning() })
 
     expect(result.triggered).toBe(true)
-    expect(result.deleted.map(g => g.version)).toEqual(['20260101000001', '20260102000002'])
+    expect(result.deleted.map(g => g.name)).toEqual(['20260101000001', '20260102000002'])
     expect(result.freedBytes).toBe(400)
     expect(result.usageBytesAfter).toBe(600)
     expect(result.ratioAfter).toBeCloseTo(0.6)
@@ -162,7 +243,7 @@ describe('runPrune', () => {
 
     const result = await runPrune(client, { ...baseOptions, manifests })
 
-    expect(result.deleted.map(g => g.version)).toEqual(['20260102000002', '20260103000003'])
+    expect(result.deleted.map(g => g.name)).toEqual(['20260102000002', '20260103000003'])
     expect(deleteItem).not.toHaveBeenCalledWith('file:20260101000001')
   })
 
@@ -189,7 +270,7 @@ describe('runPrune', () => {
     })
 
     expect(deleteItem).not.toHaveBeenCalled()
-    expect(result.deleted.map(g => g.version)).toEqual(['20260101000001', '20260102000002'])
+    expect(result.deleted.map(g => g.name)).toEqual(['20260101000001', '20260102000002'])
     expect(result.freedBytes).toBe(400)
   })
 
@@ -205,7 +286,7 @@ describe('runPrune', () => {
     expect(result.usageBytesBefore).toBe(900)
     expect(result.triggered).toBe(true)
     // Needs 300 B freed; only the two oldest managed versions are eligible.
-    expect(result.deleted.map(g => g.version)).toEqual(['20260101000001', '20260102000002'])
+    expect(result.deleted.map(g => g.name)).toEqual(['20260101000001', '20260102000002'])
     expect(deleteItem).not.toHaveBeenCalledWith('other')
   })
 
@@ -220,7 +301,32 @@ describe('runPrune', () => {
     const result = await runPrune(client, { ...baseOptions, manifests: manifestsMentioning() })
 
     expect(result.usageBytesBefore).toBe(1000)
-    expect(result.deleted.map(g => g.version)).toEqual(['20260101000001', '20260102000002'])
+    expect(result.deleted.map(g => g.name)).toEqual(['20260101000001', '20260102000002'])
+  })
+
+  it('purges stray entries before touching any release', async () => {
+    // 5 x 200 B of releases plus 100 B of junk = 1100 B; freeing 500 B gets under target.
+    const items: MonitorItem[] = [
+      ...itemsFor(VERSIONS),
+      { id: 'f:scratch', path: `${PREFIX}/scratch`, itemType: 'folder', size: 0, creationDate: 900 },
+      { id: 'j1', path: `${PREFIX}/scratch/x.exe`, itemType: 'file', size: 60, creationDate: 900 },
+      { id: 'j2', path: `${PREFIX}/leftover.bin`, itemType: 'file', size: 40, creationDate: 901 }
+    ]
+    const { client, deleteItem } = fakeClient(items)
+
+    const result = await runPrune(client, { ...baseOptions, manifests: manifestsMentioning() })
+
+    expect(result.deleted.map(g => g.name)).toEqual([
+      'scratch',
+      'leftover.bin',
+      '20260101000001',
+      '20260102000002'
+    ])
+    expect(result.freedBytes).toBe(500)
+    // The stray folder's own item is removed after its contents.
+    expect(deleteItem).toHaveBeenCalledWith('j1')
+    expect(deleteItem).toHaveBeenCalledWith('f:scratch')
+    expect(deleteItem).toHaveBeenCalledWith('j2')
   })
 
   it('records a delete failure and keeps going until the target is met', async () => {
@@ -235,7 +341,7 @@ describe('runPrune', () => {
     expect(result.errors[0]).toMatch(/VirusTotal said no/)
     // The failed file still occupies its 200 B, so a third version goes to reach the target.
     expect(result.freedBytes).toBe(400)
-    expect(result.deleted.map(g => g.version)).toEqual([
+    expect(result.deleted.map(g => g.name)).toEqual([
       '20260101000001',
       '20260102000002',
       '20260103000003'

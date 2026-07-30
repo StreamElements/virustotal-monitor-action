@@ -35,13 +35,22 @@ export interface UploadResult {
   bytesUploaded: number
 }
 
-/** All files sharing one `<prefix>/<version>/` folder — the unit of pruning. */
-export interface VersionGroup {
+/**
+ * One top-level entry under a managed prefix, with everything beneath it — the unit of pruning.
+ *
+ * Usually that is a `<prefix>/<version>/` release folder, but it is equally a stray folder or a
+ * loose file. Anything sitting in managed storage counts against the quota, so anything there
+ * is a candidate; the retention filters, not the path shape, decide what survives.
+ */
+export interface PruneGroup {
   prefix: string
-  version: string
+  /** The entry's own name: a version, a stray folder name, or a filename. */
+  name: string
   path: string
+  /** Whether `name` reads as a release version. Non-versions are purged first. */
+  versionLike: boolean
   files: MonitorItem[]
-  /** Folder items for this version, deleted after their contents. */
+  /** Folder items for this entry, deleted after their contents. */
   folders: MonitorItem[]
   sizeBytes: number
   /** Oldest creation_date across the group's files; 0 when Monitor reported none. */
@@ -51,7 +60,7 @@ export interface VersionGroup {
 export type KeepReason = 'manifest' | 'recent' | 'pinned'
 
 export interface RetentionDecision {
-  group: VersionGroup
+  group: PruneGroup
   keep: boolean
   reason?: KeepReason
 }
@@ -64,7 +73,7 @@ export interface PruneResult {
   ratioAfter: number
   triggered: boolean
   dryRun: boolean
-  deleted: VersionGroup[]
+  deleted: PruneGroup[]
   kept: RetentionDecision[]
   freedBytes: number
   /** Groups we would still need to delete but could not, because everything left is protected. */

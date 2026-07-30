@@ -1,7 +1,7 @@
 import { Logger, silentLogger } from './logging'
 import { ManifestIndex, emptyManifestIndex } from './manifests'
-import { basename, isUnder, joinPath, normalizePath, segmentUnder } from './paths'
-import { MonitorItem, PruneResult, RetentionDecision, VersionGroup } from './types'
+import { basename, isUnder, joinPath, looksLikeVersion, normalizePath, topLevelUnder } from './paths'
+import { MonitorItem, PruneResult, RetentionDecision, PruneGroup } from './types'
 import { formatBytes, formatDuration } from './format'
 import { compareVersions, versionSpellings } from './version'
 import { MonitorClient } from './vt-client'
@@ -24,23 +24,30 @@ export interface PruneOptions {
   logger?: Logger
 }
 
-/** Buckets a flat item list into `<prefix>/<version>/` groups — the unit we delete. */
-export function buildVersionGroups(items: MonitorItem[], prefixes: string[]): VersionGroup[] {
+/**
+ * Buckets a flat item list by top-level entry under each managed prefix — the unit we delete.
+ *
+ * Every entry counts, not only `<prefix>/<version>/` folders: a stray folder or a loose file
+ * consumes the same quota, and leaving it unreachable by prune is how storage fills up with
+ * things nobody can name. What survives is decided by the retention filters below.
+ */
+export function buildPruneGroups(items: MonitorItem[], prefixes: string[]): PruneGroup[] {
   const normalizedPrefixes = prefixes.map(normalizePath)
-  const groups = new Map<string, VersionGroup>()
+  const groups = new Map<string, PruneGroup>()
 
   for (const item of items) {
     for (const prefix of normalizedPrefixes) {
-      const version = segmentUnder(item.path, prefix)
-      if (!version) continue
+      const name = topLevelUnder(item.path, prefix)
+      if (!name) continue
 
-      const key = `${prefix}/${version}`
+      const key = `${prefix}/${name}`
       let group = groups.get(key)
       if (!group) {
         group = {
           prefix,
-          version,
-          path: joinPath(prefix, version),
+          name,
+          path: joinPath(prefix, name),
+          versionLike: looksLikeVersion(name),
           files: [],
           folders: [],
           sizeBytes: 0,
@@ -49,6 +56,7 @@ export function buildVersionGroups(items: MonitorItem[], prefixes: string[]): Ve
         groups.set(key, group)
       }
 
+      // A folder entry and its contents both land here; so does a loose file, as its own group.
       if (item.itemType === 'folder') {
         group.folders.push(item)
       } else {
@@ -62,22 +70,24 @@ export function buildVersionGroups(items: MonitorItem[], prefixes: string[]): Ve
     }
   }
 
-  // The version folder itself is a child of the prefix, so `segmentUnder` skips it; pick it up here.
-  for (const item of items) {
-    if (item.itemType !== 'folder') continue
-    const group = [...groups.values()].find(candidate => candidate.path === item.path)
-    if (group && !group.folders.some(folder => folder.id === item.id)) {
-      group.folders.push(item)
-    }
-  }
-
   return [...groups.values()]
 }
 
 /** Oldest first — the order in which groups become deletion candidates. */
-export function sortOldestFirst(groups: VersionGroup[]): VersionGroup[] {
+export function sortOldestFirst(groups: PruneGroup[]): PruneGroup[] {
   return [...groups].sort((a, b) => {
-    const byVersion = compareVersions(a.version, b.version)
+    // Entries that are not versions go first. They are not part of the release history the
+    // keep-newest-N rule protects, so they should neither outlive a real release nor occupy a
+    // protection slot that a real release needs.
+    if (a.versionLike !== b.versionLike) return a.versionLike ? 1 : -1
+
+    if (!a.versionLike) {
+      // Nothing meaningful to compare in the names, so fall back to when they appeared.
+      if (a.creationDate !== b.creationDate) return a.creationDate - b.creationDate
+      return a.name < b.name ? -1 : a.name > b.name ? 1 : 0
+    }
+
+    const byVersion = compareVersions(a.name, b.name)
     if (byVersion !== 0) return byVersion
     return a.creationDate - b.creationDate
   })
@@ -88,11 +98,11 @@ export function sortOldestFirst(groups: VersionGroup[]): VersionGroup[] {
  * newest `keepVersions` per prefix, keep anything explicitly pinned.
  */
 export function decideRetention(
-  groups: VersionGroup[],
+  groups: PruneGroup[],
   options: { keepVersions: number; manifests: ManifestIndex; pinnedVersions: string[] }
 ): RetentionDecision[] {
   const recent = new Set<string>()
-  const byPrefix = new Map<string, VersionGroup[]>()
+  const byPrefix = new Map<string, PruneGroup[]>()
   for (const group of groups) {
     const list = byPrefix.get(group.prefix) ?? []
     list.push(group)
@@ -109,12 +119,12 @@ export function decideRetention(
   const pinned = new Set(options.pinnedVersions.flatMap(version => versionSpellings(version)))
 
   return groups.map(group => {
-    const tokens = [...versionSpellings(group.version), ...group.files.map(file => basename(file.path))]
+    const tokens = [...versionSpellings(group.name), ...group.files.map(file => basename(file.path))]
 
     if (options.manifests.references(tokens)) {
       return { group, keep: true, reason: 'manifest' as const }
     }
-    if (versionSpellings(group.version).some(spelling => pinned.has(spelling))) {
+    if (versionSpellings(group.name).some(spelling => pinned.has(spelling))) {
       return { group, keep: true, reason: 'pinned' as const }
     }
     if (recent.has(group.path)) {
@@ -130,14 +140,27 @@ export async function runPrune(client: MonitorClient, options: PruneOptions): Pr
   const prefixes = options.prefixes.map(normalizePath)
 
   const { items, usageBytes } = await collectUsage(client, options, logger)
-  const groups = buildVersionGroups(items, prefixes)
+  const groups = buildPruneGroups(items, prefixes)
   const ratioBefore = options.quotaBytes > 0 ? usageBytes / options.quotaBytes : 0
 
   logger.info(
     `Monitor usage: ${formatBytes(usageBytes)} of ${formatBytes(options.quotaBytes)} ` +
       `(${(ratioBefore * 100).toFixed(1)}%), high watermark ${(options.highWatermark * 100).toFixed(0)}%`
   )
-  logger.info(`Found ${groups.length} managed version folder(s) under ${prefixes.join(', ')}`)
+  const unrecognised = groups.filter(group => !group.versionLike)
+  logger.info(
+    `Found ${groups.length} prunable entr(y/ies) under ${prefixes.join(', ')} — ` +
+      `${groups.length - unrecognised.length} release version(s)` +
+      `${unrecognised.length > 0 ? `, ${unrecognised.length} not matching the version convention` : ''}`
+  )
+  if (unrecognised.length > 0) {
+    logger.info(
+      `Entries that are not release versions are considered first, and are purged unless a ` +
+        `manifest references them or they are pinned: ${unrecognised
+          .map(group => `${group.name} (${formatBytes(group.sizeBytes)})`)
+          .join(', ')}`
+    )
+  }
 
   const decisions = decideRetention(groups, {
     keepVersions: options.keepVersions,
@@ -183,14 +206,17 @@ export async function runPrune(client: MonitorClient, options: PruneOptions): Pr
   for (const group of candidates) {
     if (freed >= bytesToFree) break
 
+    const what = `${group.path} (${group.files.length} file(s), ${formatBytes(group.sizeBytes)}` +
+      `${group.versionLike ? '' : ', not a release version'})`
+
     if (options.dryRun) {
-      logger.info(`[dry-run] Would delete ${group.path} (${group.files.length} file(s), ${formatBytes(group.sizeBytes)})`)
+      logger.info(`[dry-run] Would delete ${what}`)
       result.deleted.push(group)
       freed += group.sizeBytes
       continue
     }
 
-    logger.info(`Deleting ${group.path} (${group.files.length} file(s), ${formatBytes(group.sizeBytes)})`)
+    logger.info(`Deleting ${what}`)
     const deletedGroup = await deleteGroup(client, group, logger, result.errors)
     result.deleted.push(group)
     freed += deletedGroup
@@ -219,7 +245,7 @@ export async function runPrune(client: MonitorClient, options: PruneOptions): Pr
 /** Deletes a version's files (then its folders) and returns the bytes actually freed. */
 async function deleteGroup(
   client: MonitorClient,
-  group: VersionGroup,
+  group: PruneGroup,
   logger: Logger,
   errors: string[]
 ): Promise<number> {

@@ -1,4 +1,13 @@
-import { asFolderPath, basename, dirname, isUnder, joinPath, normalizePath, segmentUnder } from '../src/paths'
+import {
+  asFolderPath,
+  basename,
+  dirname,
+  isUnder,
+  joinPath,
+  looksLikeVersion,
+  normalizePath,
+  topLevelUnder
+} from '../src/paths'
 
 describe('normalizePath', () => {
   it('forces a leading slash, collapses separators and drops the trailing slash', () => {
@@ -42,15 +51,36 @@ describe('isUnder', () => {
   })
 })
 
-describe('segmentUnder', () => {
-  it('returns the version folder for a file inside it', () => {
-    expect(segmentUnder('/p/w/20260729000746/setup.exe', '/p/w')).toBe('20260729000746')
-    expect(segmentUnder('/p/w/20260729000746/sub/setup.exe', '/p/w')).toBe('20260729000746')
+describe('topLevelUnder', () => {
+  it('returns the version folder for a file inside it, however deep', () => {
+    expect(topLevelUnder('/p/w/20260729000746/setup.exe', '/p/w')).toBe('20260729000746')
+    expect(topLevelUnder('/p/w/20260729000746/sub/setup.exe', '/p/w')).toBe('20260729000746')
   })
 
-  it('returns undefined for the version folder itself and for loose files', () => {
-    expect(segmentUnder('/p/w/20260729000746', '/p/w')).toBeUndefined()
-    expect(segmentUnder('/p/w/README.txt', '/p/w')).toBeUndefined()
-    expect(segmentUnder('/other/x/y.exe', '/p/w')).toBeUndefined()
+  it('returns the entry itself for a folder or a loose file, so both can be pruned', () => {
+    expect(topLevelUnder('/p/w/20260729000746', '/p/w')).toBe('20260729000746')
+    expect(topLevelUnder('/p/w/README.txt', '/p/w')).toBe('README.txt')
+    expect(topLevelUnder('/p/w/scratch/old.exe', '/p/w')).toBe('scratch')
+  })
+
+  it('returns undefined for anything outside the prefix', () => {
+    expect(topLevelUnder('/other/x/y.exe', '/p/w')).toBeUndefined()
+    expect(topLevelUnder('/p/w', '/p/w')).toBeUndefined()
+  })
+})
+
+describe('looksLikeVersion', () => {
+  it('accepts both spellings a release uses', () => {
+    expect(looksLikeVersion('20260729000746')).toBe(true)
+    expect(looksLikeVersion('26.7.29.746')).toBe(true)
+    expect(looksLikeVersion('20260729_000746')).toBe(true)
+  })
+
+  it('rejects names that are not versions', () => {
+    expect(looksLikeVersion('README.txt')).toBe(false)
+    expect(looksLikeVersion('scratch')).toBe(false)
+    expect(looksLikeVersion('20260729000746-backup')).toBe(false)
+    expect(looksLikeVersion('obs-streamelements-setup.exe')).toBe(false)
+    expect(looksLikeVersion('')).toBe(false)
   })
 })

@@ -169,6 +169,31 @@ Everything else is a candidate. Candidates are deleted oldest-first — version 
 order — until usage is under `target-watermark`. If the policy protects too much to reach the
 target, the run reports the shortfall as a warning instead of deleting something protected.
 
+### What counts as a candidate
+
+**Every top-level entry under a managed prefix**, not only folders that follow the
+`<prefix>/<version>/` convention. A stray folder, a leftover file uploaded by hand, a directory
+from an abandoned layout — each occupies the same quota as a release, and anything prune cannot
+reach is storage that can never be reclaimed.
+
+Entries whose name is not a version (`README.txt`, `scratch`, `20260729000746-backup`) are
+ordered **before** every release, so they are purged first and — importantly — cannot occupy a
+`keep-versions` slot that a real release needs. A version is digits with optional separators:
+`20260729000746` or `26.7.29.746`.
+
+They are still subject to every filter above: a stray file a manifest happens to reference is
+kept, as is anything pinned. Prune reports them explicitly before acting:
+
+```
+Found 8 prunable entr(y/ies) under /obs-streamelements/windows — 6 release version(s), 2 not
+matching the version convention
+Entries that are not release versions are considered first, and are purged unless a manifest
+references them or they are pinned: scratch (1.20 MiB), leftover.bin (40 B)
+```
+
+The boundary remains `managed-prefixes`: anything outside it is never touched, whatever its
+shape. Widen that input only if you intend prune to own more of the account.
+
 ## Rate limiting
 
 VirusTotal enforces three budgets per key and answers with HTTP 429 once one is crossed.

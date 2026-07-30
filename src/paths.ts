@@ -47,14 +47,28 @@ export function isUnder(child: string, parent: string): boolean {
 }
 
 /**
- * The first path segment below `prefix`, i.e. the version folder name.
- * Returns undefined for files sitting directly in the prefix — those are never pruned.
+ * The first path segment below `prefix`, whether or not anything lives beneath it.
+ *
+ * `/p/w/20260729000746/setup.exe` and `/p/w/20260729000746` both yield `20260729000746`, and a
+ * loose `/p/w/README.txt` yields `README.txt`. Everything directly under a managed prefix is a
+ * prune candidate, not only paths that follow the version convention — an unrecognised folder
+ * still consumes the storage quota.
  */
-export function segmentUnder(child: string, prefix: string): string | undefined {
+export function topLevelUnder(child: string, prefix: string): string | undefined {
   if (!isUnder(child, prefix)) return undefined
   const normalizedPrefix = normalizePath(prefix)
   const rest = normalizePath(child).slice(normalizedPrefix === '/' ? 1 : normalizedPrefix.length + 1)
-  const [segment, ...tail] = rest.split('/')
-  if (!segment || tail.length === 0) return undefined
-  return segment
+  const [segment] = rest.split('/')
+  return segment || undefined
+}
+
+/**
+ * Whether a name looks like a release version: digits, optionally separated. Matches both
+ * spellings SE.Live uses — `20260729000746` and `26.7.29.746` — and nothing else.
+ *
+ * This decides ordering, not eligibility. Names that are not versions are purged first, since
+ * they are not part of the release history that the keep-newest-N rule exists to protect.
+ */
+export function looksLikeVersion(name: string): boolean {
+  return /^\d+([._-]\d+)*$/.test(name)
 }
