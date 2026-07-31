@@ -96,9 +96,9 @@ inputs:
     default: 'true'
   verbose:
     description: |
-      Log every API call, its status, timing and response headers. Equivalent to enabling
-      ACTIONS_STEP_DEBUG, but settable per step. Request headers are never logged — they carry
-      the API key.
+      Log every API call, its status, timing, response headers and response body. Equivalent to
+      enabling ACTIONS_STEP_DEBUG, but settable per step. Request headers are never logged — they
+      carry the API key, which is also redacted from URLs, errors and bodies.
     required: false
     default: 'false'
   dry-run:

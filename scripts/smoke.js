@@ -373,6 +373,7 @@ async function main(port) {
   check('logs the outgoing request', verbosely('^→ GET http'), run.stdout.slice(0, 300))
   check('logs the status and timing', verbosely('^← 200 in \\d+ms'), '')
   check('logs response headers', verbosely('^  headers: .*content-type='), '')
+  check('logs the response body', verbosely('^  body: \\{"data"'), '')
   // ::add-mask:: has to contain the key — that directive is what tells the runner to mask it.
   // Any other line containing it is a leak, most likely a URL that embeds the key in its path.
   const leaked = run.stdout

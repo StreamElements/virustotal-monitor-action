@@ -38381,7 +38381,7 @@ function versionSpellings(version) {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.MonitorClient = exports.MonitorApiError = exports.DIRECT_UPLOAD_LIMIT_BYTES = exports.DEFAULT_API_URL = void 0;
+exports.MonitorClient = exports.MonitorApiError = exports.DEFAULT_BODY_LOG_LIMIT = exports.DIRECT_UPLOAD_LIMIT_BYTES = exports.DEFAULT_API_URL = void 0;
 exports.formatHeaders = formatHeaders;
 exports.parseRetryAfter = parseRetryAfter;
 const node_fs_1 = __nccwpck_require__(3024);
@@ -38399,6 +38399,8 @@ exports.DIRECT_UPLOAD_LIMIT_BYTES = 32 * 1024 * 1024;
 /** VirusTotal caps collection pages at 40 items. */
 const PAGE_LIMIT = 40;
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
+/** A full listing page runs to a few kilobytes; enough to diagnose, bounded enough to read. */
+exports.DEFAULT_BODY_LOG_LIMIT = 8192;
 class MonitorApiError extends Error {
     constructor(message, statusCode, code) {
         super(message);
@@ -38433,6 +38435,7 @@ class MonitorClient {
         this.maxRetries = options.maxRetries ?? 4;
         this.retryBaseMs = options.retryBaseMs ?? 1000;
         this.rateLimitBackoffMs = options.rateLimitBackoffMs ?? 60_000;
+        this.bodyLogLimit = options.bodyLogLimit ?? exports.DEFAULT_BODY_LOG_LIMIT;
         this.logger = options.logger ?? logging_1.silentLogger;
         this.requestFn = options.requestFn ?? undici_1.request;
         this.sleepFn = options.sleepFn ?? defaultSleep;
@@ -38513,6 +38516,18 @@ class MonitorClient {
         if (!this.apiKey)
             return text;
         return text.split(this.apiKey).join('***').split(encodeURIComponent(this.apiKey)).join('***');
+    }
+    /**
+     * Response body for the debug log, redacted and bounded. A listing page runs to several
+     * kilobytes and a user object can echo the key back, so neither raw nor unbounded will do.
+     */
+    previewBody(text) {
+        if (text.length === 0)
+            return '(empty)';
+        const safe = this.redact(text).replace(/\r?\n/g, ' ');
+        if (safe.length <= this.bodyLogLimit)
+            return safe;
+        return `${safe.slice(0, this.bodyLogLimit)}… (${safe.length - this.bodyLogLimit} more character(s) omitted)`;
     }
     /** Most recent daily storage snapshot, or undefined when Monitor has no statistics yet. */
     async getStatistics() {
@@ -38617,6 +38632,7 @@ class MonitorClient {
                 this.logger.debug(`← ${response.statusCode} in ${Date.now() - startedAt}ms, ${text.length} byte(s) of body`);
                 // Response headers only. Request headers carry x-apikey and are never logged.
                 this.logger.debug(`  headers: ${formatHeaders(response.headers)}`);
+                this.logger.debug(`  body: ${this.previewBody(text)}`);
                 if (response.statusCode >= 200 && response.statusCode < 300) {
                     return (text.length > 0 ? JSON.parse(text) : {});
                 }

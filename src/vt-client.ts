@@ -22,6 +22,9 @@ const PAGE_LIMIT = 40
 
 const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504])
 
+/** A full listing page runs to a few kilobytes; enough to diagnose, bounded enough to read. */
+export const DEFAULT_BODY_LOG_LIMIT = 8192
+
 export class MonitorApiError extends Error {
   constructor(
     message: string,
@@ -42,6 +45,8 @@ export interface MonitorClientOptions {
   retryBaseMs?: number
   /** Wait after a 429 that carries no Retry-After. Defaults to one full minute window. */
   rateLimitBackoffMs?: number
+  /** Characters of response body to log in verbose mode before truncating. */
+  bodyLogLimit?: number
   logger?: Logger
   /** Paces calls to stay inside VirusTotal's quotas. Omit to send without pacing. */
   rateLimiter?: Pick<RateLimiter, 'acquire'> & Partial<Pick<RateLimiter, 'penalize'>>
@@ -92,6 +97,7 @@ export class MonitorClient {
   private readonly sleepFn: (ms: number) => Promise<void>
   private readonly rateLimiter?: Pick<RateLimiter, 'acquire'> & Partial<Pick<RateLimiter, 'penalize'>>
   private readonly rateLimitBackoffMs: number
+  private readonly bodyLogLimit: number
 
   constructor(options: MonitorClientOptions) {
     this.apiKey = options.apiKey
@@ -99,6 +105,7 @@ export class MonitorClient {
     this.maxRetries = options.maxRetries ?? 4
     this.retryBaseMs = options.retryBaseMs ?? 1000
     this.rateLimitBackoffMs = options.rateLimitBackoffMs ?? 60_000
+    this.bodyLogLimit = options.bodyLogLimit ?? DEFAULT_BODY_LOG_LIMIT
     this.logger = options.logger ?? silentLogger
     this.requestFn = options.requestFn ?? request
     this.sleepFn = options.sleepFn ?? defaultSleep
@@ -194,6 +201,17 @@ export class MonitorClient {
   private redact(text: string): string {
     if (!this.apiKey) return text
     return text.split(this.apiKey).join('***').split(encodeURIComponent(this.apiKey)).join('***')
+  }
+
+  /**
+   * Response body for the debug log, redacted and bounded. A listing page runs to several
+   * kilobytes and a user object can echo the key back, so neither raw nor unbounded will do.
+   */
+  private previewBody(text: string): string {
+    if (text.length === 0) return '(empty)'
+    const safe = this.redact(text).replace(/\r?\n/g, ' ')
+    if (safe.length <= this.bodyLogLimit) return safe
+    return `${safe.slice(0, this.bodyLogLimit)}… (${safe.length - this.bodyLogLimit} more character(s) omitted)`
   }
 
   /** Most recent daily storage snapshot, or undefined when Monitor has no statistics yet. */
@@ -337,6 +355,7 @@ export class MonitorClient {
         )
         // Response headers only. Request headers carry x-apikey and are never logged.
         this.logger.debug(`  headers: ${formatHeaders(response.headers)}`)
+        this.logger.debug(`  body: ${this.previewBody(text)}`)
 
         if (response.statusCode >= 200 && response.statusCode < 300) {
           return (text.length > 0 ? JSON.parse(text) : {}) as T

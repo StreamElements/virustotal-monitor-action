@@ -130,14 +130,18 @@ change; shorter ones stay in debug so a fast run stays quiet.
 → GET https://www.virustotal.com/api/v3/monitor/items?filter=path%3A%2F&limit=40
 ← 200 in 412ms, 1183 byte(s) of body
   headers: content-type=application/json x-ratelimit-remaining=17
+  body: {"data":[{"type":"monitor_item","id":"…","attributes":{"path":"/obs-streamelements",…
 ```
+
+Bodies are logged on one line and truncated past 8192 characters, with the omitted count noted —
+a listing page is several kilobytes and there is one per folder.
 
 It is equivalent to setting `ACTIONS_STEP_DEBUG`, but per step, so it works without the
 repository secret that not everyone can set.
 
-**Request headers are never logged** — they carry `x-apikey`. The one URL that embeds the key is
-`/users/{key}/overall_quotas`, and the key is redacted out of it (`/users/***/overall_quotas`) in
-both logs and error messages. `core.setSecret` would mask it on a runner anyway, but a credential
+**Request headers are never logged** — they carry `x-apikey`. The key is redacted from everything
+that is logged: the one URL that embeds it (`/users/***/overall_quotas`), error messages, and
+response bodies, since a VirusTotal user object can echo the key back. `core.setSecret` would mask it on a runner anyway, but a credential
 should not be written out and then masked; there is a test asserting it never appears.
 
 ## Retention policy

@@ -456,6 +456,73 @@ describe('verbose logging', () => {
     expect(debugged).toContain('headers: content-type=application/json x-ratelimit-remaining=17')
   })
 
+  it('logs the response body', async () => {
+    const log = capturing()
+    const { requestFn } = fakeTransport([{ statusCode: 200, payload: { data: [item('/a/one.exe')] } }])
+
+    await new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      logger: log
+    }).listFolder('/a')
+
+    const body = log.lines.debug.find(line => line.startsWith('  body:'))
+    expect(body).toContain('"path":"/a/one.exe"')
+  })
+
+  it('truncates a large body rather than flooding the log', async () => {
+    const log = capturing()
+    const { requestFn } = fakeTransport([
+      { statusCode: 200, raw: JSON.stringify({ data: [], note: 'x'.repeat(500) }) }
+    ])
+
+    await new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      logger: log,
+      bodyLogLimit: 100
+    }).listFolder('/a')
+
+    const body = log.lines.debug.find(line => line.startsWith('  body:')) as string
+    expect(body).toMatch(/… \(\d+ more character\(s\) omitted\)$/)
+    expect(body.length).toBeLessThan(200)
+  })
+
+  it('collapses newlines and marks an empty body', async () => {
+    const log = capturing()
+    const { requestFn } = fakeTransport([{ statusCode: 200, raw: '' }])
+
+    await new MonitorClient({
+      apiKey: 'k',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      logger: log
+    }).deleteItem('id')
+
+    expect(log.lines.debug).toContain('  body: (empty)')
+  })
+
+  it('redacts the key from a body that echoes it back', async () => {
+    // A VirusTotal user object can carry the key, so a raw body dump would leak it.
+    const log = capturing()
+    const { requestFn } = fakeTransport([
+      { statusCode: 200, raw: JSON.stringify({ data: { id: 'super-secret-key' } }) }
+    ])
+
+    await new MonitorClient({
+      apiKey: 'super-secret-key',
+      apiUrl: 'https://vt.test/api/v3',
+      requestFn: requestFn as never,
+      logger: log
+    }).getApiQuotas()
+
+    const logged = [...log.lines.debug, ...log.lines.info].join('\n')
+    expect(logged).toContain('"id":"***"')
+    expect(logged).not.toContain('super-secret-key')
+  })
+
   it('redacts the api key from the quota URL, which carries it in the path', async () => {
     const log = capturing()
     const { requestFn } = fakeTransport([{ statusCode: 200, payload: { data: {} } }])
