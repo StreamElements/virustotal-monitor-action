@@ -1,6 +1,6 @@
 import { Logger, silentLogger } from './logging'
 import { ManifestIndex, emptyManifestIndex } from './manifests'
-import { basename, isUnder, joinPath, looksLikeVersion, normalizePath, topLevelUnder } from './paths'
+import { basename, joinPath, looksLikeVersion, normalizePath, topLevelUnder } from './paths'
 import { MonitorItem, PruneResult, RetentionDecision, PruneGroup } from './types'
 import { formatBytes, formatDuration } from './format'
 import { compareVersions, versionSpellings } from './version'
@@ -336,22 +336,16 @@ async function collectUsage(
     return { items, usageBytes: stats.storageBytesCount, fileCount: stats.storageFilesCount }
   }
 
-  // The quota is account-wide, so usage is measured from the Monitor root even though only
-  // items under the managed prefixes are prunable. The managed prefixes are then walked
-  // directly and merged in: a root listing that does not expose the intermediate folders
-  // would otherwise report zero usage and silently disable pruning.
+  // Enumeration starts at the managed prefixes rather than the Monitor root. Walking from `/`
+  // descends into those same prefixes anyway, so listing both meant paying for the managed
+  // subtree twice — and at four requests a minute that is the most expensive part of the run.
   logger.info(
-    'Enumerating existing items in VirusTotal Monitor storage to measure usage. Monitor has no ' +
+    `Enumerating items under ${options.prefixes.join(', ')} to measure usage. Monitor has no ` +
       'recursive listing, so this is one request per folder and is usually the slowest part of the run.'
   )
   const startedAt = Date.now()
 
-  logger.info('Walking the Monitor root (/) for account-wide usage')
-  const fromRoot = await client.walk('/')
-
-  logger.info(`Walking the managed prefix(es): ${options.prefixes.join(', ')}`)
-  const fromPrefixes = (await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat()
-  const items = dedupe([...fromRoot, ...fromPrefixes])
+  const items = dedupe((await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat())
 
   const fileCount = items.filter(item => item.itemType === 'file').length
   logger.info(
@@ -363,15 +357,47 @@ async function collectUsage(
     .filter(item => item.itemType === 'file')
     .reduce((total, item) => total + item.size, 0)
 
-  const unmanaged = items
-    .filter(item => item.itemType === 'file')
-    .filter(item => !options.prefixes.some(prefix => isUnder(item.path, prefix)))
-    .reduce((total, item) => total + item.size, 0)
-  if (unmanaged > 0) {
-    logger.info(`${formatBytes(unmanaged)} sits outside the managed prefixes and will never be pruned.`)
+  await warnAboutUnmanagedStorage(client, usageBytes, logger)
+  return { items, usageBytes, fileCount }
+}
+
+/**
+ * The quota is account-wide but we now only measure the managed prefixes, so storage elsewhere
+ * would go uncounted and the watermark could stay quiet while the account is actually full —
+ * uploads then fail with QuotaExceededError for no visible reason.
+ *
+ * One call to /monitor/statistics gives the account-wide figure to compare against. It is a
+ * daily snapshot, so it informs a warning rather than the number pruning acts on.
+ */
+async function warnAboutUnmanagedStorage(
+  client: MonitorClient,
+  managedBytes: number,
+  logger: Logger
+): Promise<void> {
+  let stats
+  try {
+    stats = await client.getStatistics()
+  } catch (error) {
+    logger.debug(`Could not cross-check account-wide storage: ${(error as Error).message}`)
+    return
+  }
+  if (!stats || stats.storageBytesCount <= 0) return
+
+  const unmanaged = stats.storageBytesCount - managedBytes
+  // A day-old snapshot will not match to the byte; only a real gap is worth reporting.
+  if (unmanaged <= managedBytes * 0.05) {
+    logger.debug(
+      `Account-wide storage (${formatBytes(stats.storageBytesCount)}) matches what was enumerated`
+    )
+    return
   }
 
-  return { items, usageBytes, fileCount }
+  logger.warning(
+    `VirusTotal reports ${formatBytes(stats.storageBytesCount)} stored account-wide, but only ` +
+      `${formatBytes(managedBytes)} sits under the managed prefixes. The other ` +
+      `${formatBytes(unmanaged)} counts against the same quota and cannot be pruned from here. ` +
+      'Widen managed-prefixes to cover it, or lower quota-bytes to leave room for it.'
+  )
 }
 
 function dedupe(items: MonitorItem[]): MonitorItem[] {

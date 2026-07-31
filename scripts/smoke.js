@@ -34,6 +34,7 @@ const state = {
   uploads: [],
   quotaReads: 0,
   uploadUrlsIssued: 0,
+  listedFolders: [],
   rateLimitNextUpload: false,
   baseUrl: ''
 }
@@ -87,6 +88,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === 'GET' && url.pathname === '/api/v3/monitor/items') {
     const folder = (url.searchParams.get('filter') || '').replace(/^path:/, '')
+    state.listedFolders.push(folder)
     return send(200, {
       data: state.items.filter(item => {
         const itemPath = item.attributes.path
@@ -270,6 +272,26 @@ async function main(port) {
   check('exit 0', run.exitCode === 0, run.exitCode)
   check('warned instead of failing', /::warning::/.test(run.stdout), run.stdout.slice(0, 300))
 
+  console.log('--- enumeration starts at the managed prefixes, not the root ---')
+  state.listedFolders = []
+  run = await runAction({ ...pruneInputs, 'dry-run': 'true' })
+  check(
+    'never listed the Monitor root',
+    !state.listedFolders.includes('/'),
+    JSON.stringify(state.listedFolders)
+  )
+  check(
+    'listed the managed prefix and each version folder exactly once',
+    state.listedFolders.length === new Set(state.listedFolders).size &&
+      state.listedFolders[0] === `${PREFIX}/`,
+    JSON.stringify(state.listedFolders)
+  )
+  check(
+    'six listings, not the eleven a root walk would cost',
+    state.listedFolders.length === 6,
+    `${state.listedFolders.length}: ${JSON.stringify(state.listedFolders)}`
+  )
+
   console.log('--- the file ceiling can trigger a prune on its own ---')
   run = await runAction({
     ...pruneInputs,
@@ -376,7 +398,7 @@ async function main(port) {
   check('states the mode up front', says('^VirusTotal Monitor — mode: prune, DRY RUN'), run.stdout.slice(0, 200))
   check('explains the retention policy', says('Keeping the newest .* version\\(s\\) per prefix'), '')
   check('numbers the manifest fetches', says('\\[1/1\\] http'), '')
-  check('warns before the slow enumeration', says('^Enumerating existing items in VirusTotal Monitor storage'), '')
+  check('warns before the slow enumeration', says('^Enumerating items under /.* to measure usage'), '')
   check('reports what enumeration found', says('^Enumerated \\d+ item\\(s\\)'), '')
   check('shows per-folder progress', says('^Listing /.* — folder 1'), '')
   check('closes with a request count', says('VirusTotal API request\\(s\\) in '), '')

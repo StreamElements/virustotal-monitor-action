@@ -274,28 +274,77 @@ describe('runPrune', () => {
     expect(result.freedBytes).toBe(400)
   })
 
-  it('counts storage outside the managed prefixes towards usage but never prunes it', async () => {
-    const items: MonitorItem[] = [
-      ...itemsFor(VERSIONS.slice(0, 3)),
-      { id: 'other', path: '/legacy/big.exe', itemType: 'file', size: 300 }
-    ]
-    const { client, deleteItem } = fakeClient(items)
+  it('enumerates from the managed prefixes, never from the Monitor root', async () => {
+    // Walking / would descend into these same prefixes, so listing both pays for the managed
+    // subtree twice — the most expensive thing a paced run can do.
+    const { client } = fakeClient(itemsFor(VERSIONS.slice(0, 3)))
 
-    const result = await runPrune(client, { ...baseOptions, manifests: manifestsMentioning() })
+    await runPrune(client, { ...baseOptions, manifests: manifestsMentioning() })
 
-    expect(result.usageBytesBefore).toBe(900)
-    expect(result.triggered).toBe(true)
-    // Needs 300 B freed; only the two oldest managed versions are eligible.
-    expect(result.deleted.map(g => g.name)).toEqual(['20260101000001', '20260102000002'])
-    expect(deleteItem).not.toHaveBeenCalledWith('other')
+    expect(client.walk).toHaveBeenCalledTimes(1)
+    expect(client.walk).toHaveBeenCalledWith(PREFIX)
+    expect(client.walk).not.toHaveBeenCalledWith('/')
   })
 
-  it('still sees managed versions when the root listing omits the intermediate folders', async () => {
-    const items = itemsFor(VERSIONS)
-    const deleteItem = jest.fn().mockResolvedValue(undefined)
+  it('walks each managed prefix once', async () => {
+    const other = '/obs-streamelements/macos'
+    const { client } = fakeClient(itemsFor(VERSIONS.slice(0, 3)))
+
+    await runPrune(client, {
+      ...baseOptions,
+      prefixes: [PREFIX, other],
+      manifests: manifestsMentioning()
+    })
+
+    expect(client.walk).toHaveBeenCalledTimes(2)
+    expect(client.walk).toHaveBeenCalledWith(PREFIX)
+    expect(client.walk).toHaveBeenCalledWith(other)
+  })
+
+  it('warns when the account holds storage the managed prefixes cannot reach', async () => {
+    // Only the prefixes are enumerated now, so storage elsewhere counts against the same quota
+    // while being invisible here. One statistics call surfaces the gap.
+    const warnings: string[] = []
     const client = {
-      walk: jest.fn(async (path: string) => (path === '/' ? [] : items)),
-      deleteItem
+      walk: jest.fn().mockResolvedValue(itemsFor(VERSIONS.slice(0, 3))),
+      deleteItem: jest.fn(),
+      getStatistics: jest.fn().mockResolvedValue({ date: 1, storageBytesCount: 900, storageFilesCount: 9 })
+    } as unknown as MonitorClient
+
+    await runPrune(client, {
+      ...baseOptions,
+      manifests: manifestsMentioning(),
+      logger: { debug: () => undefined, info: () => undefined, warning: m => warnings.push(m) }
+    })
+
+    // 600 B managed of 900 B account-wide: 300 B lives somewhere we cannot prune.
+    expect(warnings.join('\n')).toMatch(/900 B stored account-wide, but only 600 B/)
+    expect(warnings.join('\n')).toMatch(/300 B counts against the same quota/)
+  })
+
+  it('stays quiet when the account-wide figure matches what was enumerated', async () => {
+    const warnings: string[] = []
+    const client = {
+      walk: jest.fn().mockResolvedValue(itemsFor(VERSIONS.slice(0, 3))),
+      deleteItem: jest.fn(),
+      getStatistics: jest.fn().mockResolvedValue({ date: 1, storageBytesCount: 610, storageFilesCount: 3 })
+    } as unknown as MonitorClient
+
+    await runPrune(client, {
+      ...baseOptions,
+      manifests: manifestsMentioning(),
+      logger: { debug: () => undefined, info: () => undefined, warning: m => warnings.push(m) }
+    })
+
+    // A daily snapshot will not match to the byte; only a real gap is worth reporting.
+    expect(warnings).toEqual([])
+  })
+
+  it('carries on when the account-wide cross-check is unavailable', async () => {
+    const client = {
+      walk: jest.fn().mockResolvedValue(itemsFor(VERSIONS)),
+      deleteItem: jest.fn().mockResolvedValue(undefined),
+      getStatistics: jest.fn().mockRejectedValue(new Error('no statistics for this account'))
     } as unknown as MonitorClient
 
     const result = await runPrune(client, { ...baseOptions, manifests: manifestsMentioning() })

@@ -69,7 +69,7 @@ storage housekeeping must never take a release down with it.
 | `keep-versions` | `10` | Newest versions per prefix that are never deleted, regardless of channel. |
 | `manifest-urls` | | Newline-separated channel manifest URLs. Required to prune for real. |
 | `pin-versions` | | Extra versions to protect. |
-| `usage-source` | `walk` | `walk` sums the live item tree; `statistics` uses Monitor's daily snapshot (cheaper, up to a day stale). |
+| `usage-source` | `walk` | `walk` sums the live items under the managed prefixes; `statistics` uses Monitor's account-wide daily snapshot (one call, up to a day stale). |
 | `rate-limit-per-minute` | `4` | Max API requests per minute. `0` disables the window. |
 | `rate-limit-per-day` | `500` | Max API requests per day. `0` disables the window. |
 | `rate-limit-per-month` | `15500` | Max API requests per rolling 30 days. `0` disables the window. |
@@ -103,7 +103,14 @@ watermarks, retention, rate limits — so a log read months later explains itsel
 the workflow file alongside it.
 
 The slow part is enumerating Monitor storage. There is no recursive listing, so it is one
-request per folder, and at 4 requests/minute that is ~15s each. Every folder is announced as it
+request per folder, and at 4 requests/minute that is ~15s each. Enumeration starts at the
+**managed prefixes**, not the Monitor root — walking `/` descends into those same prefixes
+anyway, so listing both paid for the managed subtree twice.
+
+That means storage outside the managed prefixes is not measured, even though it counts against
+the same account-wide quota. A single `/monitor/statistics` call cross-checks the total, and the
+run warns if the account holds materially more than was enumerated — otherwise the watermark
+could stay quiet while the account is genuinely full. Every folder is announced as it
 is listed, with a running count, because a paced run with no output is indistinguishable from a
 hung one:
 
@@ -263,7 +270,7 @@ For prune jobs, pair this with `on-error: warn` so a rate-limit stop never fails
 | Run | Requests |
 | --- | --- |
 | Upload, 2 installers | 1 folder listing + 1 per file, + 1 for seeding = ~4 |
-| Prune, 10 versions, nothing to delete | seeding + root walk + prefix walk + 1 per version folder = ~13 |
+| Prune, 10 versions, nothing to delete | seeding + prefix listing + 1 per version folder + 1 cross-check = ~13 |
 | Prune that deletes 3 versions | the above + 2 per version deleted (file + folder) = ~19 |
 
 At the default 4/minute the first four are immediate and everything after paces at one per 15

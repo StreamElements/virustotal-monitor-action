@@ -38035,32 +38035,51 @@ async function collectUsage(client, options, logger) {
         const items = dedupe((await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat());
         return { items, usageBytes: stats.storageBytesCount, fileCount: stats.storageFilesCount };
     }
-    // The quota is account-wide, so usage is measured from the Monitor root even though only
-    // items under the managed prefixes are prunable. The managed prefixes are then walked
-    // directly and merged in: a root listing that does not expose the intermediate folders
-    // would otherwise report zero usage and silently disable pruning.
-    logger.info('Enumerating existing items in VirusTotal Monitor storage to measure usage. Monitor has no ' +
+    // Enumeration starts at the managed prefixes rather than the Monitor root. Walking from `/`
+    // descends into those same prefixes anyway, so listing both meant paying for the managed
+    // subtree twice — and at four requests a minute that is the most expensive part of the run.
+    logger.info(`Enumerating items under ${options.prefixes.join(', ')} to measure usage. Monitor has no ` +
         'recursive listing, so this is one request per folder and is usually the slowest part of the run.');
     const startedAt = Date.now();
-    logger.info('Walking the Monitor root (/) for account-wide usage');
-    const fromRoot = await client.walk('/');
-    logger.info(`Walking the managed prefix(es): ${options.prefixes.join(', ')}`);
-    const fromPrefixes = (await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat();
-    const items = dedupe([...fromRoot, ...fromPrefixes]);
+    const items = dedupe((await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat());
     const fileCount = items.filter(item => item.itemType === 'file').length;
     logger.info(`Enumerated ${items.length} item(s) — ${fileCount} file(s), ` +
         `${items.length - fileCount} folder(s) — in ${(0, format_1.formatDuration)(Date.now() - startedAt)}`);
     const usageBytes = items
         .filter(item => item.itemType === 'file')
         .reduce((total, item) => total + item.size, 0);
-    const unmanaged = items
-        .filter(item => item.itemType === 'file')
-        .filter(item => !options.prefixes.some(prefix => (0, paths_1.isUnder)(item.path, prefix)))
-        .reduce((total, item) => total + item.size, 0);
-    if (unmanaged > 0) {
-        logger.info(`${(0, format_1.formatBytes)(unmanaged)} sits outside the managed prefixes and will never be pruned.`);
-    }
+    await warnAboutUnmanagedStorage(client, usageBytes, logger);
     return { items, usageBytes, fileCount };
+}
+/**
+ * The quota is account-wide but we now only measure the managed prefixes, so storage elsewhere
+ * would go uncounted and the watermark could stay quiet while the account is actually full —
+ * uploads then fail with QuotaExceededError for no visible reason.
+ *
+ * One call to /monitor/statistics gives the account-wide figure to compare against. It is a
+ * daily snapshot, so it informs a warning rather than the number pruning acts on.
+ */
+async function warnAboutUnmanagedStorage(client, managedBytes, logger) {
+    let stats;
+    try {
+        stats = await client.getStatistics();
+    }
+    catch (error) {
+        logger.debug(`Could not cross-check account-wide storage: ${error.message}`);
+        return;
+    }
+    if (!stats || stats.storageBytesCount <= 0)
+        return;
+    const unmanaged = stats.storageBytesCount - managedBytes;
+    // A day-old snapshot will not match to the byte; only a real gap is worth reporting.
+    if (unmanaged <= managedBytes * 0.05) {
+        logger.debug(`Account-wide storage (${(0, format_1.formatBytes)(stats.storageBytesCount)}) matches what was enumerated`);
+        return;
+    }
+    logger.warning(`VirusTotal reports ${(0, format_1.formatBytes)(stats.storageBytesCount)} stored account-wide, but only ` +
+        `${(0, format_1.formatBytes)(managedBytes)} sits under the managed prefixes. The other ` +
+        `${(0, format_1.formatBytes)(unmanaged)} counts against the same quota and cannot be pruned from here. ` +
+        'Widen managed-prefixes to cover it, or lower quota-bytes to leave room for it.');
 }
 function dedupe(items) {
     const byId = new Map();
