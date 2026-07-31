@@ -66,6 +66,7 @@ export async function run(): Promise<void> {
     pruneResult = await runPrune(client, {
       prefixes: config.managedPrefixes,
       quotaBytes: config.quotaBytes,
+      quotaFiles: config.quotaFiles,
       highWatermark: config.highWatermark,
       targetWatermark: config.targetWatermark,
       keepVersions: config.keepVersions,
@@ -116,10 +117,17 @@ function describeRun(config: ActionConfig): void {
   if (config.mode !== 'upload') {
     core.info(
       `Pruning ${config.managedPrefixes.join(', ')} once usage passes ` +
-        `${(config.highWatermark * 100).toFixed(0)}% of ${formatBytes(config.quotaBytes)}, ` +
+        `${(config.highWatermark * 100).toFixed(0)}% of ${formatBytes(config.quotaBytes)}` +
+        `${config.quotaFiles > 0 ? ` or ${config.quotaFiles} file(s)` : ''}, ` +
         `down to ${(config.targetWatermark * 100).toFixed(0)}%. Keeping the newest ` +
         `${config.keepVersions} version(s) per prefix plus anything a live manifest references.`
     )
+    if (config.quotaFiles === 0) {
+      core.info(
+        'No quota-files set: only the byte ceiling can trigger a prune. VirusTotal also limits ' +
+          'the number of files and reports QuotaExceededError for either.'
+      )
+    }
   }
   core.info(
     `Rate limits: ${describeLimit(config.rateLimits.perMinute, 'minute')}, ` +
@@ -232,6 +240,8 @@ function setOutputs(uploadResult: UploadResult | undefined, pruneResult: PruneRe
   core.setOutput('freed-bytes', pruneResult ? pruneResult.freedBytes : 0)
   core.setOutput('usage-bytes', pruneResult ? pruneResult.usageBytesAfter : 0)
   core.setOutput('usage-ratio', pruneResult ? pruneResult.ratioAfter.toFixed(4) : '0')
+  core.setOutput('usage-files', pruneResult ? pruneResult.fileCountAfter : 0)
+  core.setOutput('usage-files-ratio', pruneResult ? pruneResult.fileRatioAfter.toFixed(4) : '0')
 }
 
 async function writeSummary(
@@ -267,6 +277,10 @@ async function writeSummary(
       [
         `- Usage before: **${formatBytes(pruneResult.usageBytesBefore)}** of ` +
           `${formatBytes(pruneResult.quotaBytes)} (${(pruneResult.ratioBefore * 100).toFixed(1)}%)`,
+        pruneResult.quotaFiles > 0
+          ? `- Files before: **${pruneResult.fileCountBefore}** of ${pruneResult.quotaFiles} ` +
+            `(${(pruneResult.fileRatioBefore * 100).toFixed(1)}%)`
+          : `- Files: ${pruneResult.fileCountBefore} (no quota-files limit configured)`,
         `- High watermark: ${(config.highWatermark * 100).toFixed(0)}% · target ` +
           `${(config.targetWatermark * 100).toFixed(0)}% · keep ${config.keepVersions} version(s) per prefix`,
         `- Prune triggered: **${pruneResult.triggered ? 'yes' : 'no'}**`,

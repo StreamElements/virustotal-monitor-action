@@ -12,6 +12,8 @@ export interface ActionConfig {
   remoteDir: string
   managedPrefixes: string[]
   quotaBytes: number
+  /** Monitor's file-count limit; 0 leaves that dimension untracked. */
+  quotaFiles: number
   highWatermark: number
   targetWatermark: number
   keepVersions: number
@@ -151,6 +153,7 @@ export function parseConfig(getInput: InputReader): ActionConfig {
     remoteDir,
     managedPrefixes,
     quotaBytes: parseSize(withDefault(getInput('quota-bytes'), '1073741824'), 'quota-bytes'),
+    quotaFiles: parseLimit(getInput('quota-files'), 'quota-files', 0),
     highWatermark,
     targetWatermark,
     keepVersions,

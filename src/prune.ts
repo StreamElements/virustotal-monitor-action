@@ -10,6 +10,11 @@ export interface PruneOptions {
   /** Monitor folders whose `<prefix>/<version>/` children are prunable. */
   prefixes: string[]
   quotaBytes: number
+  /**
+   * Monitor's file-count limit. VirusTotal counts files as well as bytes, and reports
+   * QuotaExceededError for either. 0 leaves the dimension untracked.
+   */
+  quotaFiles?: number
   /** Fraction of quota at which pruning starts, e.g. 0.8. */
   highWatermark: number
   /** Fraction of quota to get back down to, e.g. 0.6. */
@@ -139,14 +144,25 @@ export async function runPrune(client: MonitorClient, options: PruneOptions): Pr
   const manifests = options.manifests ?? emptyManifestIndex
   const prefixes = options.prefixes.map(normalizePath)
 
-  const { items, usageBytes } = await collectUsage(client, options, logger)
+  const { items, usageBytes, fileCount } = await collectUsage(client, options, logger)
   const groups = buildPruneGroups(items, prefixes)
+  const quotaFiles = options.quotaFiles ?? 0
   const ratioBefore = options.quotaBytes > 0 ? usageBytes / options.quotaBytes : 0
+  const fileRatioBefore = quotaFiles > 0 ? fileCount / quotaFiles : 0
 
   logger.info(
     `Monitor usage: ${formatBytes(usageBytes)} of ${formatBytes(options.quotaBytes)} ` +
       `(${(ratioBefore * 100).toFixed(1)}%), high watermark ${(options.highWatermark * 100).toFixed(0)}%`
   )
+  // VirusTotal counts files as well as bytes and answers QuotaExceededError for either, so the
+  // file ceiling has to be able to trigger a prune on its own.
+  if (quotaFiles > 0) {
+    logger.info(
+      `Monitor files: ${fileCount} of ${quotaFiles} (${(fileRatioBefore * 100).toFixed(1)}%)`
+    )
+  } else {
+    logger.debug(`Monitor holds ${fileCount} file(s); no file limit configured (quota-files)`)
+  }
   const unrecognised = groups.filter(group => !group.versionLike)
   logger.info(
     `Found ${groups.length} prunable entr(y/ies) under ${prefixes.join(', ')} — ` +
@@ -177,7 +193,13 @@ export async function runPrune(client: MonitorClient, options: PruneOptions): Pr
     quotaBytes: options.quotaBytes,
     ratioBefore,
     ratioAfter: ratioBefore,
-    triggered: ratioBefore >= options.highWatermark,
+    fileCountBefore: fileCount,
+    fileCountAfter: fileCount,
+    quotaFiles,
+    fileRatioBefore,
+    fileRatioAfter: fileRatioBefore,
+    freedFiles: 0,
+    triggered: ratioBefore >= options.highWatermark || fileRatioBefore >= options.highWatermark,
     dryRun: options.dryRun,
     deleted: [],
     kept: decisions.filter(decision => decision.keep),
@@ -195,16 +217,21 @@ export async function runPrune(client: MonitorClient, options: PruneOptions): Pr
 
   const targetBytes = options.quotaBytes * options.targetWatermark
   const bytesToFree = Math.max(0, usageBytes - targetBytes)
+  const filesToFree = quotaFiles > 0 ? Math.max(0, fileCount - quotaFiles * options.targetWatermark) : 0
   logger.info(
-    `Need to free ${formatBytes(bytesToFree)} to reach the ` +
-      `${(options.targetWatermark * 100).toFixed(0)}% target (${formatBytes(targetBytes)})`
+    `Need to free ${formatBytes(bytesToFree)}` +
+      `${filesToFree > 0 ? ` and ${filesToFree} file(s)` : ''} to reach the ` +
+      `${(options.targetWatermark * 100).toFixed(0)}% target (${formatBytes(targetBytes)}` +
+      `${quotaFiles > 0 ? `, ${Math.floor(quotaFiles * options.targetWatermark)} file(s)` : ''})`
   )
 
   const candidates = sortOldestFirst(decisions.filter(decision => !decision.keep).map(decision => decision.group))
 
   let freed = 0
+  let freedFiles = 0
   for (const group of candidates) {
-    if (freed >= bytesToFree) break
+    // Both dimensions have to come back under target; whichever is binding keeps the loop going.
+    if (freed >= bytesToFree && freedFiles >= filesToFree) break
 
     const what = `${group.path} (${group.files.length} file(s), ${formatBytes(group.sizeBytes)}` +
       `${group.versionLike ? '' : ', not a release version'})`
@@ -213,47 +240,62 @@ export async function runPrune(client: MonitorClient, options: PruneOptions): Pr
       logger.info(`[dry-run] Would delete ${what}`)
       result.deleted.push(group)
       freed += group.sizeBytes
+      freedFiles += group.files.length
       continue
     }
 
     logger.info(`Deleting ${what}`)
-    const deletedGroup = await deleteGroup(client, group, logger, result.errors)
+    const deleted = await deleteGroup(client, group, logger, result.errors)
     result.deleted.push(group)
-    freed += deletedGroup
+    freed += deleted.bytes
+    freedFiles += deleted.files
   }
 
   result.freedBytes = freed
+  result.freedFiles = freedFiles
   result.usageBytesAfter = usageBytes - freed
+  result.fileCountAfter = fileCount - freedFiles
   result.ratioAfter = options.quotaBytes > 0 ? result.usageBytesAfter / options.quotaBytes : 0
+  result.fileRatioAfter = quotaFiles > 0 ? result.fileCountAfter / quotaFiles : 0
   result.shortfallBytes = Math.max(0, bytesToFree - freed)
+  const shortfallFiles = Math.max(0, filesToFree - freedFiles)
 
-  if (result.shortfallBytes > 0) {
+  if (result.shortfallBytes > 0 || shortfallFiles > 0) {
+    const over = [
+      result.shortfallBytes > 0 ? formatBytes(result.shortfallBytes) : '',
+      shortfallFiles > 0 ? `${shortfallFiles} file(s)` : ''
+    ]
+      .filter(Boolean)
+      .join(' and ')
     logger.warning(
-      `Could not reach the target watermark: ${formatBytes(result.shortfallBytes)} still over. ` +
+      `Could not reach the target watermark: ${over} still over. ` +
         'Everything else is protected by the retention policy (manifest-referenced, pinned, or one of the ' +
         `${options.keepVersions} most recent versions).`
     )
   }
 
   logger.info(
-    `${options.dryRun ? '[dry-run] Would free' : 'Freed'} ${formatBytes(freed)} — ` +
-      `usage now ${formatBytes(result.usageBytesAfter)} (${(result.ratioAfter * 100).toFixed(1)}%)`
+    `${options.dryRun ? '[dry-run] Would free' : 'Freed'} ${formatBytes(freed)} in ${freedFiles} file(s) — ` +
+      `usage now ${formatBytes(result.usageBytesAfter)} (${(result.ratioAfter * 100).toFixed(1)}%)` +
+      `${quotaFiles > 0 ? `, ${result.fileCountAfter} file(s) (${(result.fileRatioAfter * 100).toFixed(1)}%)` : ''}`
   )
   return result
 }
 
-/** Deletes a version's files (then its folders) and returns the bytes actually freed. */
+/** Deletes an entry's files (then its folders) and returns what was actually freed. */
 async function deleteGroup(
   client: MonitorClient,
   group: PruneGroup,
   logger: Logger,
   errors: string[]
-): Promise<number> {
+): Promise<{ bytes: number; files: number }> {
   let freed = 0
+  let freedFiles = 0
   for (const file of group.files) {
     try {
       await client.deleteItem(file.id)
       freed += file.size
+      freedFiles++
       logger.debug(`Deleted ${file.path}`)
     } catch (error) {
       const message = `Failed to delete ${file.path}: ${(error as Error).message}`
@@ -273,14 +315,14 @@ async function deleteGroup(
       logger.warning(`Failed to delete folder ${folder.path}: ${(error as Error).message}`)
     }
   }
-  return freed
+  return { bytes: freed, files: freedFiles }
 }
 
 async function collectUsage(
   client: MonitorClient,
   options: PruneOptions,
   logger: Logger
-): Promise<{ items: MonitorItem[]; usageBytes: number }> {
+): Promise<{ items: MonitorItem[]; usageBytes: number; fileCount: number }> {
   if (options.usageSource === 'statistics') {
     const stats = await client.getStatistics()
     if (!stats) {
@@ -291,7 +333,7 @@ async function collectUsage(
         `${stats.storageFilesCount} file(s), as of ${new Date(stats.date * 1000).toISOString()}`
     )
     const items = dedupe((await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat())
-    return { items, usageBytes: stats.storageBytesCount }
+    return { items, usageBytes: stats.storageBytesCount, fileCount: stats.storageFilesCount }
   }
 
   // The quota is account-wide, so usage is measured from the Monitor root even though only
@@ -329,7 +371,7 @@ async function collectUsage(
     logger.info(`${formatBytes(unmanaged)} sits outside the managed prefixes and will never be pruned.`)
   }
 
-  return { items, usageBytes }
+  return { items, usageBytes, fileCount }
 }
 
 function dedupe(items: MonitorItem[]): MonitorItem[] {

@@ -63,6 +63,7 @@ storage housekeeping must never take a release down with it.
 | `remote-dir` | | Explicit upload folder. Overrides `path-prefix` + `version`. |
 | `managed-prefixes` | `path-prefix` | Newline-separated prefixes prune may delete from. Everything else is untouchable. |
 | `quota-bytes` | `1073741824` (1 GiB) | Storage quota. Accepts `1GB`, `1GiB`, `512mb` or a raw byte count. |
+| `quota-files` | `0` | Monitor's file-count limit. `0` leaves that dimension untracked. |
 | `high-watermark` | `0.8` | Usage fraction (`0.8`) or percentage (`80`) at which pruning starts. |
 | `target-watermark` | `0.6` | Usage to prune back down to. Must be below `high-watermark`. |
 | `keep-versions` | `10` | Newest versions per prefix that are never deleted, regardless of channel. |
@@ -172,6 +173,19 @@ A version folder is kept when **any** of these hold:
 Everything else is a candidate. Candidates are deleted oldest-first — version order, not upload
 order — until usage is under `target-watermark`. If the policy protects too much to reach the
 target, the run reports the shortfall as a warning instead of deleting something protected.
+
+### Two quota dimensions
+
+VirusTotal limits **bytes and file count**, and answers `QuotaExceededError` for either. Only
+`quota-bytes` has a default, because the ticket recorded the account's byte limit; the file limit
+is not exposed by the API, so `quota-files` defaults to `0` (untracked) and you must set it if
+your account has one. Either dimension crossing the high watermark triggers a prune, and it
+deletes until **both** are back under the target.
+
+Setting `quota-bytes` far above the real limit is the failure mode to avoid: the byte ratio then
+never moves, prune reports "nothing to prune" forever, and uploads start failing with
+`QuotaExceededError` while storage quietly fills. If in doubt, run with `dry-run: true` and check
+the reported usage against what VirusTotal shows.
 
 ### What counts as a candidate
 
@@ -300,6 +314,13 @@ the manifests do not mention yet, add it to `pin-versions`.
   re-run later.
 - **Shortfall warning** — everything left is protected. Lower `keep-versions`, or accept it and
   raise the quota with VirusTotal.
+- **`QuotaExceededError`** — this code is [documented](https://docs.virustotal.com/reference/errors)
+  as covering *both* the minute/daily/monthly request quotas **and** running out of Monitor disk
+  space or file count. Waiting fixes the first and does nothing for the second. After one full
+  window has been waited out, the action asks VirusTotal for the key's request usage: if daily
+  and monthly both have headroom, it stops retrying and says so, because the cause is storage and
+  the fix is to prune. If the quotas really are spent, or cannot be read, it keeps waiting.
+  (`TooManyRequestsError` is the unambiguous rate-limit code and is always treated as one.)
 - **HTTP 429** — should be rare now that calls are paced; it means the key's real limits are
   lower than the configured ones. The client honours `Retry-After` and retries four times, but
   lower `rate-limit-per-minute` to match reality rather than relying on retries.

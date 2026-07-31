@@ -29,7 +29,12 @@ export class MonitorApiError extends Error {
   constructor(
     message: string,
     readonly statusCode: number,
-    readonly code?: string
+    readonly code?: string,
+    /**
+     * Overrides the status-based retry decision. A 429 is normally worth retrying, but not when
+     * we have established it means Monitor storage is full — no amount of waiting frees space.
+     */
+    readonly retryable?: boolean
   ) {
     super(message)
     this.name = 'MonitorApiError'
@@ -98,6 +103,8 @@ export class MonitorClient {
   private readonly rateLimiter?: Pick<RateLimiter, 'acquire'> & Partial<Pick<RateLimiter, 'penalize'>>
   private readonly rateLimitBackoffMs: number
   private readonly bodyLogLimit: number
+  private quotaDiagnosis?: { healthy: boolean; summary: string }
+  private diagnosingQuotas = false
 
   constructor(options: MonitorClientOptions) {
     this.apiKey = options.apiKey
@@ -116,16 +123,31 @@ export class MonitorClient {
    * Usage VirusTotal reports for this key. Used to seed the rate limiter so the daily and
    * monthly budgets account for requests made outside this run.
    */
-  async getApiQuotas(): Promise<{ dailyUsed?: number; monthlyUsed?: number; dailyAllowed?: number }> {
+  async getApiQuotas(): Promise<{
+    dailyUsed?: number
+    dailyAllowed?: number
+    monthlyUsed?: number
+    monthlyAllowed?: number
+  }> {
+    return this.fetchQuotas()
+  }
+
+  private async fetchQuotas(retries?: number): Promise<{
+    dailyUsed?: number
+    dailyAllowed?: number
+    monthlyUsed?: number
+    monthlyAllowed?: number
+  }> {
     type Quota = { used?: number; allowed?: number }
     const payload = await this.json<{
       data?: { api_requests_daily?: Quota; api_requests_monthly?: Quota }
-    }>('GET', `/users/${encodeURIComponent(this.apiKey)}/overall_quotas`)
+    }>('GET', `/users/${encodeURIComponent(this.apiKey)}/overall_quotas`, retries)
 
     return {
       dailyUsed: payload.data?.api_requests_daily?.used,
       dailyAllowed: payload.data?.api_requests_daily?.allowed,
-      monthlyUsed: payload.data?.api_requests_monthly?.used
+      monthlyUsed: payload.data?.api_requests_monthly?.used,
+      monthlyAllowed: payload.data?.api_requests_monthly?.allowed
     }
   }
 
@@ -191,6 +213,37 @@ export class MonitorClient {
 
   async deleteItem(id: string): Promise<void> {
     await this.json('DELETE', `/monitor/items/${encodeURIComponent(id)}`)
+  }
+
+  /**
+   * Reads the key's request quotas to decide whether a QuotaExceededError is really about
+   * requests. Asked at most once per run, and never from inside itself.
+   *
+   * `healthy` means daily and monthly both have headroom, so the 429 is not explained by them.
+   * The per-minute quota is not reported by this endpoint, which is why the caller only asks
+   * after a full minute has already been waited out.
+   */
+  private async diagnoseQuotas(): Promise<{ healthy: boolean; summary: string } | undefined> {
+    if (this.quotaDiagnosis !== undefined) return this.quotaDiagnosis
+    if (this.diagnosingQuotas) return undefined
+
+    this.diagnosingQuotas = true
+    try {
+      // Single attempt: this is a diagnostic, and retrying it would multiply the very wait it
+      // exists to avoid. A 429 here is itself an answer — the request quotas are not healthy.
+      const quotas = await this.fetchQuotas(0)
+      const daily = describeQuota('daily', quotas.dailyUsed, quotas.dailyAllowed)
+      const monthly = describeQuota('monthly', quotas.monthlyUsed, quotas.monthlyAllowed)
+      // Unknown figures are not evidence of headroom, so an unreadable quota stays inconclusive.
+      const healthy = daily.hasHeadroom === true && monthly.hasHeadroom === true
+      this.quotaDiagnosis = { healthy, summary: `${daily.text}, ${monthly.text}` }
+    } catch (error) {
+      this.logger.debug(`Could not read quotas to explain the 429: ${(error as Error).message}`)
+      this.quotaDiagnosis = { healthy: false, summary: 'quota usage unavailable' }
+    } finally {
+      this.diagnosingQuotas = false
+    }
+    return this.quotaDiagnosis
   }
 
   /**
@@ -295,8 +348,8 @@ export class MonitorClient {
     return id
   }
 
-  private json<T>(method: 'GET' | 'DELETE' | 'POST', pathAndQuery: string): Promise<T> {
-    return this.send<T>({ method, url: `${this.apiUrl}${pathAndQuery}` })
+  private json<T>(method: 'GET' | 'DELETE' | 'POST', pathAndQuery: string, retries?: number): Promise<T> {
+    return this.send<T>({ method, url: `${this.apiUrl}${pathAndQuery}`, retries })
   }
 
   private async send<T>(options: {
@@ -309,15 +362,18 @@ export class MonitorClient {
     headersTimeoutMs?: number
     /** Human description used in rate-limit messages, e.g. "upload of /a/setup.exe". */
     what?: string
+    /** Overrides the client's retry budget. 0 means a single attempt. */
+    retries?: number
   }): Promise<T> {
+    const maxRetries = options.retries ?? this.maxRetries
     let lastError: Error | undefined
     let retryDelayMs: number | undefined
 
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
       if (attempt > 0) {
         const delay = retryDelayMs ?? this.retryBaseMs * 2 ** (attempt - 1)
         this.logger.debug(
-          `Retry ${attempt}/${this.maxRetries} for ${options.method} ${this.redact(options.url)} in ${delay}ms`
+          `Retry ${attempt}/${maxRetries} for ${options.method} ${this.redact(options.url)} in ${delay}ms`
         )
         await this.sleepFn(delay)
       }
@@ -329,7 +385,7 @@ export class MonitorClient {
       const url = options.resolveUrl ? await options.resolveUrl() : options.url
       const startedAt = Date.now()
       const safeUrl = this.redact(url)
-      const attemptOf = attempt > 0 ? ` (attempt ${attempt + 1} of ${this.maxRetries + 1})` : ''
+      const attemptOf = attempt > 0 ? ` (attempt ${attempt + 1} of ${maxRetries + 1})` : ''
       const bodySize = options.headers?.['content-length']
       this.logger.debug(
         `→ ${options.method} ${safeUrl}${bodySize ? ` [${formatBytes(Number(bodySize))} body]` : ''}${attemptOf}`
@@ -362,8 +418,29 @@ export class MonitorClient {
         }
 
         const error = toApiError(response.statusCode, text, options.method, safeUrl)
-        if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === this.maxRetries) {
+        if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === maxRetries) {
           throw error
+        }
+
+        // QuotaExceededError is overloaded: the docs say it covers the minute/daily/monthly
+        // request quotas *and* running out of Monitor disk space or file count. Waiting clears
+        // the first and does nothing for the second, so once a full window has already been
+        // waited out, ask whether the request quotas are actually spent before waiting again.
+        if (response.statusCode === 429 && error.code === 'QuotaExceededError' && attempt >= 1) {
+          const quotas = await this.diagnoseQuotas()
+          if (quotas && quotas.healthy) {
+            throw new MonitorApiError(
+              `VirusTotal refused the ${options.what ?? `${options.method} request`} with ` +
+                `QuotaExceededError after waiting a full rate-limit window. Request quotas are not ` +
+                `exhausted (${quotas.summary}), so this is most likely Monitor storage: the account ` +
+                'is out of disk space or out of files. Run the prune step to free space, and check ' +
+                'that quota-bytes matches the real Monitor limit. If instead the key allows fewer ' +
+                'requests per minute than rate-limit-per-minute, lower that input.',
+              response.statusCode,
+              error.code,
+              false
+            )
+          }
         }
 
         if (response.statusCode === 429) {
@@ -375,7 +452,7 @@ export class MonitorClient {
           this.rateLimiter?.penalize?.(retryDelayMs)
           this.logger.warning(
             `VirusTotal rate-limited the ${options.what ?? `${options.method} request`} (HTTP 429). ` +
-              `Waiting ${Math.round(retryDelayMs / 1000)}s before attempt ${attempt + 2} of ${this.maxRetries + 1}. ` +
+              `Waiting ${Math.round(retryDelayMs / 1000)}s before attempt ${attempt + 2} of ${maxRetries + 1}. ` +
               'If this recurs, lower rate-limit-per-minute to match the key.'
           )
         } else {
@@ -385,13 +462,14 @@ export class MonitorClient {
         lastError = error
       } catch (caught) {
         if (caught instanceof MonitorApiError) {
-          if (!RETRYABLE_STATUS.has(caught.statusCode) || attempt === this.maxRetries) throw caught
+          const retryable = caught.retryable ?? RETRYABLE_STATUS.has(caught.statusCode)
+          if (!retryable || attempt === maxRetries) throw caught
           lastError = caught
           continue
         }
         // Network-level failure (reset socket, DNS, timeout): worth another attempt.
         const error = caught instanceof Error ? caught : new Error(String(caught))
-        if (attempt === this.maxRetries) throw error
+        if (attempt === maxRetries) throw error
         this.logger.warning(`${options.method} ${safeUrl} failed: ${this.redact(error.message)} — retrying`)
         lastError = error
       }
@@ -399,6 +477,18 @@ export class MonitorClient {
 
     throw lastError ?? new Error(`${options.method} ${this.redact(options.url)} failed`)
   }
+}
+
+/** `hasHeadroom` is undefined when VirusTotal did not report the figure — unknown is not healthy. */
+function describeQuota(
+  label: string,
+  used: number | undefined,
+  allowed: number | undefined
+): { hasHeadroom: boolean | undefined; text: string } {
+  if (typeof used !== 'number' || typeof allowed !== 'number' || allowed <= 0) {
+    return { hasHeadroom: undefined, text: `${label} unknown` }
+  }
+  return { hasHeadroom: used < allowed, text: `${label} ${used}/${allowed}` }
 }
 
 /**

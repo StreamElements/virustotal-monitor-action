@@ -37171,6 +37171,7 @@ function parseConfig(getInput) {
         remoteDir,
         managedPrefixes,
         quotaBytes: parseSize(withDefault(getInput('quota-bytes'), '1073741824'), 'quota-bytes'),
+        quotaFiles: parseLimit(getInput('quota-files'), 'quota-files', 0),
         highWatermark,
         targetWatermark,
         keepVersions,
@@ -37355,6 +37356,7 @@ async function run() {
         pruneResult = await (0, prune_1.runPrune)(client, {
             prefixes: config.managedPrefixes,
             quotaBytes: config.quotaBytes,
+            quotaFiles: config.quotaFiles,
             highWatermark: config.highWatermark,
             targetWatermark: config.targetWatermark,
             keepVersions: config.keepVersions,
@@ -37399,9 +37401,14 @@ function describeRun(config) {
     }
     if (config.mode !== 'upload') {
         core.info(`Pruning ${config.managedPrefixes.join(', ')} once usage passes ` +
-            `${(config.highWatermark * 100).toFixed(0)}% of ${(0, format_1.formatBytes)(config.quotaBytes)}, ` +
+            `${(config.highWatermark * 100).toFixed(0)}% of ${(0, format_1.formatBytes)(config.quotaBytes)}` +
+            `${config.quotaFiles > 0 ? ` or ${config.quotaFiles} file(s)` : ''}, ` +
             `down to ${(config.targetWatermark * 100).toFixed(0)}%. Keeping the newest ` +
             `${config.keepVersions} version(s) per prefix plus anything a live manifest references.`);
+        if (config.quotaFiles === 0) {
+            core.info('No quota-files set: only the byte ceiling can trigger a prune. VirusTotal also limits ' +
+                'the number of files and reports QuotaExceededError for either.');
+        }
     }
     core.info(`Rate limits: ${describeLimit(config.rateLimits.perMinute, 'minute')}, ` +
         `${describeLimit(config.rateLimits.perDay, 'day')}, ` +
@@ -37491,6 +37498,8 @@ function setOutputs(uploadResult, pruneResult) {
     core.setOutput('freed-bytes', pruneResult ? pruneResult.freedBytes : 0);
     core.setOutput('usage-bytes', pruneResult ? pruneResult.usageBytesAfter : 0);
     core.setOutput('usage-ratio', pruneResult ? pruneResult.ratioAfter.toFixed(4) : '0');
+    core.setOutput('usage-files', pruneResult ? pruneResult.fileCountAfter : 0);
+    core.setOutput('usage-files-ratio', pruneResult ? pruneResult.fileRatioAfter.toFixed(4) : '0');
 }
 async function writeSummary(config, uploadResult, pruneResult) {
     const summary = core.summary.addHeading(`VirusTotal Monitor${config.dryRun ? ' (dry run)' : ''}`, 2);
@@ -37519,6 +37528,10 @@ async function writeSummary(config, uploadResult, pruneResult) {
         summary.addRaw([
             `- Usage before: **${(0, format_1.formatBytes)(pruneResult.usageBytesBefore)}** of ` +
                 `${(0, format_1.formatBytes)(pruneResult.quotaBytes)} (${(pruneResult.ratioBefore * 100).toFixed(1)}%)`,
+            pruneResult.quotaFiles > 0
+                ? `- Files before: **${pruneResult.fileCountBefore}** of ${pruneResult.quotaFiles} ` +
+                    `(${(pruneResult.fileRatioBefore * 100).toFixed(1)}%)`
+                : `- Files: ${pruneResult.fileCountBefore} (no quota-files limit configured)`,
             `- High watermark: ${(config.highWatermark * 100).toFixed(0)}% · target ` +
                 `${(config.targetWatermark * 100).toFixed(0)}% · keep ${config.keepVersions} version(s) per prefix`,
             `- Prune triggered: **${pruneResult.triggered ? 'yes' : 'no'}**`,
@@ -37870,11 +37883,21 @@ async function runPrune(client, options) {
     const logger = options.logger ?? logging_1.silentLogger;
     const manifests = options.manifests ?? manifests_1.emptyManifestIndex;
     const prefixes = options.prefixes.map(paths_1.normalizePath);
-    const { items, usageBytes } = await collectUsage(client, options, logger);
+    const { items, usageBytes, fileCount } = await collectUsage(client, options, logger);
     const groups = buildPruneGroups(items, prefixes);
+    const quotaFiles = options.quotaFiles ?? 0;
     const ratioBefore = options.quotaBytes > 0 ? usageBytes / options.quotaBytes : 0;
+    const fileRatioBefore = quotaFiles > 0 ? fileCount / quotaFiles : 0;
     logger.info(`Monitor usage: ${(0, format_1.formatBytes)(usageBytes)} of ${(0, format_1.formatBytes)(options.quotaBytes)} ` +
         `(${(ratioBefore * 100).toFixed(1)}%), high watermark ${(options.highWatermark * 100).toFixed(0)}%`);
+    // VirusTotal counts files as well as bytes and answers QuotaExceededError for either, so the
+    // file ceiling has to be able to trigger a prune on its own.
+    if (quotaFiles > 0) {
+        logger.info(`Monitor files: ${fileCount} of ${quotaFiles} (${(fileRatioBefore * 100).toFixed(1)}%)`);
+    }
+    else {
+        logger.debug(`Monitor holds ${fileCount} file(s); no file limit configured (quota-files)`);
+    }
     const unrecognised = groups.filter(group => !group.versionLike);
     logger.info(`Found ${groups.length} prunable entr(y/ies) under ${prefixes.join(', ')} — ` +
         `${groups.length - unrecognised.length} release version(s)` +
@@ -37899,7 +37922,13 @@ async function runPrune(client, options) {
         quotaBytes: options.quotaBytes,
         ratioBefore,
         ratioAfter: ratioBefore,
-        triggered: ratioBefore >= options.highWatermark,
+        fileCountBefore: fileCount,
+        fileCountAfter: fileCount,
+        quotaFiles,
+        fileRatioBefore,
+        fileRatioAfter: fileRatioBefore,
+        freedFiles: 0,
+        triggered: ratioBefore >= options.highWatermark || fileRatioBefore >= options.highWatermark,
         dryRun: options.dryRun,
         deleted: [],
         kept: decisions.filter(decision => decision.keep),
@@ -37913,12 +37942,17 @@ async function runPrune(client, options) {
     }
     const targetBytes = options.quotaBytes * options.targetWatermark;
     const bytesToFree = Math.max(0, usageBytes - targetBytes);
-    logger.info(`Need to free ${(0, format_1.formatBytes)(bytesToFree)} to reach the ` +
-        `${(options.targetWatermark * 100).toFixed(0)}% target (${(0, format_1.formatBytes)(targetBytes)})`);
+    const filesToFree = quotaFiles > 0 ? Math.max(0, fileCount - quotaFiles * options.targetWatermark) : 0;
+    logger.info(`Need to free ${(0, format_1.formatBytes)(bytesToFree)}` +
+        `${filesToFree > 0 ? ` and ${filesToFree} file(s)` : ''} to reach the ` +
+        `${(options.targetWatermark * 100).toFixed(0)}% target (${(0, format_1.formatBytes)(targetBytes)}` +
+        `${quotaFiles > 0 ? `, ${Math.floor(quotaFiles * options.targetWatermark)} file(s)` : ''})`);
     const candidates = sortOldestFirst(decisions.filter(decision => !decision.keep).map(decision => decision.group));
     let freed = 0;
+    let freedFiles = 0;
     for (const group of candidates) {
-        if (freed >= bytesToFree)
+        // Both dimensions have to come back under target; whichever is binding keeps the loop going.
+        if (freed >= bytesToFree && freedFiles >= filesToFree)
             break;
         const what = `${group.path} (${group.files.length} file(s), ${(0, format_1.formatBytes)(group.sizeBytes)}` +
             `${group.versionLike ? '' : ', not a release version'})`;
@@ -37926,33 +37960,48 @@ async function runPrune(client, options) {
             logger.info(`[dry-run] Would delete ${what}`);
             result.deleted.push(group);
             freed += group.sizeBytes;
+            freedFiles += group.files.length;
             continue;
         }
         logger.info(`Deleting ${what}`);
-        const deletedGroup = await deleteGroup(client, group, logger, result.errors);
+        const deleted = await deleteGroup(client, group, logger, result.errors);
         result.deleted.push(group);
-        freed += deletedGroup;
+        freed += deleted.bytes;
+        freedFiles += deleted.files;
     }
     result.freedBytes = freed;
+    result.freedFiles = freedFiles;
     result.usageBytesAfter = usageBytes - freed;
+    result.fileCountAfter = fileCount - freedFiles;
     result.ratioAfter = options.quotaBytes > 0 ? result.usageBytesAfter / options.quotaBytes : 0;
+    result.fileRatioAfter = quotaFiles > 0 ? result.fileCountAfter / quotaFiles : 0;
     result.shortfallBytes = Math.max(0, bytesToFree - freed);
-    if (result.shortfallBytes > 0) {
-        logger.warning(`Could not reach the target watermark: ${(0, format_1.formatBytes)(result.shortfallBytes)} still over. ` +
+    const shortfallFiles = Math.max(0, filesToFree - freedFiles);
+    if (result.shortfallBytes > 0 || shortfallFiles > 0) {
+        const over = [
+            result.shortfallBytes > 0 ? (0, format_1.formatBytes)(result.shortfallBytes) : '',
+            shortfallFiles > 0 ? `${shortfallFiles} file(s)` : ''
+        ]
+            .filter(Boolean)
+            .join(' and ');
+        logger.warning(`Could not reach the target watermark: ${over} still over. ` +
             'Everything else is protected by the retention policy (manifest-referenced, pinned, or one of the ' +
             `${options.keepVersions} most recent versions).`);
     }
-    logger.info(`${options.dryRun ? '[dry-run] Would free' : 'Freed'} ${(0, format_1.formatBytes)(freed)} — ` +
-        `usage now ${(0, format_1.formatBytes)(result.usageBytesAfter)} (${(result.ratioAfter * 100).toFixed(1)}%)`);
+    logger.info(`${options.dryRun ? '[dry-run] Would free' : 'Freed'} ${(0, format_1.formatBytes)(freed)} in ${freedFiles} file(s) — ` +
+        `usage now ${(0, format_1.formatBytes)(result.usageBytesAfter)} (${(result.ratioAfter * 100).toFixed(1)}%)` +
+        `${quotaFiles > 0 ? `, ${result.fileCountAfter} file(s) (${(result.fileRatioAfter * 100).toFixed(1)}%)` : ''}`);
     return result;
 }
-/** Deletes a version's files (then its folders) and returns the bytes actually freed. */
+/** Deletes an entry's files (then its folders) and returns what was actually freed. */
 async function deleteGroup(client, group, logger, errors) {
     let freed = 0;
+    let freedFiles = 0;
     for (const file of group.files) {
         try {
             await client.deleteItem(file.id);
             freed += file.size;
+            freedFiles++;
             logger.debug(`Deleted ${file.path}`);
         }
         catch (error) {
@@ -37973,7 +38022,7 @@ async function deleteGroup(client, group, logger, errors) {
             logger.warning(`Failed to delete folder ${folder.path}: ${error.message}`);
         }
     }
-    return freed;
+    return { bytes: freed, files: freedFiles };
 }
 async function collectUsage(client, options, logger) {
     if (options.usageSource === 'statistics') {
@@ -37984,7 +38033,7 @@ async function collectUsage(client, options, logger) {
         logger.info(`Storage from /monitor/statistics: ${(0, format_1.formatBytes)(stats.storageBytesCount)} across ` +
             `${stats.storageFilesCount} file(s), as of ${new Date(stats.date * 1000).toISOString()}`);
         const items = dedupe((await Promise.all(options.prefixes.map(prefix => client.walk(prefix)))).flat());
-        return { items, usageBytes: stats.storageBytesCount };
+        return { items, usageBytes: stats.storageBytesCount, fileCount: stats.storageFilesCount };
     }
     // The quota is account-wide, so usage is measured from the Monitor root even though only
     // items under the managed prefixes are prunable. The managed prefixes are then walked
@@ -38011,7 +38060,7 @@ async function collectUsage(client, options, logger) {
     if (unmanaged > 0) {
         logger.info(`${(0, format_1.formatBytes)(unmanaged)} sits outside the managed prefixes and will never be pruned.`);
     }
-    return { items, usageBytes };
+    return { items, usageBytes, fileCount };
 }
 function dedupe(items) {
     const byId = new Map();
@@ -38402,10 +38451,16 @@ const RETRYABLE_STATUS = new Set([408, 429, 500, 502, 503, 504]);
 /** A full listing page runs to a few kilobytes; enough to diagnose, bounded enough to read. */
 exports.DEFAULT_BODY_LOG_LIMIT = 8192;
 class MonitorApiError extends Error {
-    constructor(message, statusCode, code) {
+    constructor(message, statusCode, code, 
+    /**
+     * Overrides the status-based retry decision. A 429 is normally worth retrying, but not when
+     * we have established it means Monitor storage is full — no amount of waiting frees space.
+     */
+    retryable) {
         super(message);
         this.statusCode = statusCode;
         this.code = code;
+        this.retryable = retryable;
         this.name = 'MonitorApiError';
     }
 }
@@ -38430,6 +38485,7 @@ function parseItem(raw) {
 }
 class MonitorClient {
     constructor(options) {
+        this.diagnosingQuotas = false;
         this.apiKey = options.apiKey;
         this.apiUrl = (options.apiUrl ?? exports.DEFAULT_API_URL).replace(/\/+$/, '');
         this.maxRetries = options.maxRetries ?? 4;
@@ -38446,11 +38502,15 @@ class MonitorClient {
      * monthly budgets account for requests made outside this run.
      */
     async getApiQuotas() {
-        const payload = await this.json('GET', `/users/${encodeURIComponent(this.apiKey)}/overall_quotas`);
+        return this.fetchQuotas();
+    }
+    async fetchQuotas(retries) {
+        const payload = await this.json('GET', `/users/${encodeURIComponent(this.apiKey)}/overall_quotas`, retries);
         return {
             dailyUsed: payload.data?.api_requests_daily?.used,
             dailyAllowed: payload.data?.api_requests_daily?.allowed,
-            monthlyUsed: payload.data?.api_requests_monthly?.used
+            monthlyUsed: payload.data?.api_requests_monthly?.used,
+            monthlyAllowed: payload.data?.api_requests_monthly?.allowed
         };
     }
     /** Direct children of a Monitor folder (files and sub-folders). */
@@ -38506,6 +38566,39 @@ class MonitorClient {
     }
     async deleteItem(id) {
         await this.json('DELETE', `/monitor/items/${encodeURIComponent(id)}`);
+    }
+    /**
+     * Reads the key's request quotas to decide whether a QuotaExceededError is really about
+     * requests. Asked at most once per run, and never from inside itself.
+     *
+     * `healthy` means daily and monthly both have headroom, so the 429 is not explained by them.
+     * The per-minute quota is not reported by this endpoint, which is why the caller only asks
+     * after a full minute has already been waited out.
+     */
+    async diagnoseQuotas() {
+        if (this.quotaDiagnosis !== undefined)
+            return this.quotaDiagnosis;
+        if (this.diagnosingQuotas)
+            return undefined;
+        this.diagnosingQuotas = true;
+        try {
+            // Single attempt: this is a diagnostic, and retrying it would multiply the very wait it
+            // exists to avoid. A 429 here is itself an answer — the request quotas are not healthy.
+            const quotas = await this.fetchQuotas(0);
+            const daily = describeQuota('daily', quotas.dailyUsed, quotas.dailyAllowed);
+            const monthly = describeQuota('monthly', quotas.monthlyUsed, quotas.monthlyAllowed);
+            // Unknown figures are not evidence of headroom, so an unreadable quota stays inconclusive.
+            const healthy = daily.hasHeadroom === true && monthly.hasHeadroom === true;
+            this.quotaDiagnosis = { healthy, summary: `${daily.text}, ${monthly.text}` };
+        }
+        catch (error) {
+            this.logger.debug(`Could not read quotas to explain the 429: ${error.message}`);
+            this.quotaDiagnosis = { healthy: false, summary: 'quota usage unavailable' };
+        }
+        finally {
+            this.diagnosingQuotas = false;
+        }
+        return this.quotaDiagnosis;
     }
     /**
      * Strips the API key out of anything about to be logged or thrown. The key appears in the
@@ -38593,16 +38686,17 @@ class MonitorClient {
         }
         return id;
     }
-    json(method, pathAndQuery) {
-        return this.send({ method, url: `${this.apiUrl}${pathAndQuery}` });
+    json(method, pathAndQuery, retries) {
+        return this.send({ method, url: `${this.apiUrl}${pathAndQuery}`, retries });
     }
     async send(options) {
+        const maxRetries = options.retries ?? this.maxRetries;
         let lastError;
         let retryDelayMs;
-        for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
             if (attempt > 0) {
                 const delay = retryDelayMs ?? this.retryBaseMs * 2 ** (attempt - 1);
-                this.logger.debug(`Retry ${attempt}/${this.maxRetries} for ${options.method} ${this.redact(options.url)} in ${delay}ms`);
+                this.logger.debug(`Retry ${attempt}/${maxRetries} for ${options.method} ${this.redact(options.url)} in ${delay}ms`);
                 await this.sleepFn(delay);
             }
             retryDelayMs = undefined;
@@ -38612,7 +38706,7 @@ class MonitorClient {
             const url = options.resolveUrl ? await options.resolveUrl() : options.url;
             const startedAt = Date.now();
             const safeUrl = this.redact(url);
-            const attemptOf = attempt > 0 ? ` (attempt ${attempt + 1} of ${this.maxRetries + 1})` : '';
+            const attemptOf = attempt > 0 ? ` (attempt ${attempt + 1} of ${maxRetries + 1})` : '';
             const bodySize = options.headers?.['content-length'];
             this.logger.debug(`→ ${options.method} ${safeUrl}${bodySize ? ` [${(0, format_1.formatBytes)(Number(bodySize))} body]` : ''}${attemptOf}`);
             try {
@@ -38637,8 +38731,23 @@ class MonitorClient {
                     return (text.length > 0 ? JSON.parse(text) : {});
                 }
                 const error = toApiError(response.statusCode, text, options.method, safeUrl);
-                if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === this.maxRetries) {
+                if (!RETRYABLE_STATUS.has(response.statusCode) || attempt === maxRetries) {
                     throw error;
+                }
+                // QuotaExceededError is overloaded: the docs say it covers the minute/daily/monthly
+                // request quotas *and* running out of Monitor disk space or file count. Waiting clears
+                // the first and does nothing for the second, so once a full window has already been
+                // waited out, ask whether the request quotas are actually spent before waiting again.
+                if (response.statusCode === 429 && error.code === 'QuotaExceededError' && attempt >= 1) {
+                    const quotas = await this.diagnoseQuotas();
+                    if (quotas && quotas.healthy) {
+                        throw new MonitorApiError(`VirusTotal refused the ${options.what ?? `${options.method} request`} with ` +
+                            `QuotaExceededError after waiting a full rate-limit window. Request quotas are not ` +
+                            `exhausted (${quotas.summary}), so this is most likely Monitor storage: the account ` +
+                            'is out of disk space or out of files. Run the prune step to free space, and check ' +
+                            'that quota-bytes matches the real Monitor limit. If instead the key allows fewer ' +
+                            'requests per minute than rate-limit-per-minute, lower that input.', response.statusCode, error.code, false);
+                    }
                 }
                 if (response.statusCode === 429) {
                     // Our pacing was too optimistic for this key. Exponential backoff from a 1s base is
@@ -38648,7 +38757,7 @@ class MonitorClient {
                     retryDelayMs = parseRetryAfter(response.headers) ?? this.rateLimitBackoffMs;
                     this.rateLimiter?.penalize?.(retryDelayMs);
                     this.logger.warning(`VirusTotal rate-limited the ${options.what ?? `${options.method} request`} (HTTP 429). ` +
-                        `Waiting ${Math.round(retryDelayMs / 1000)}s before attempt ${attempt + 2} of ${this.maxRetries + 1}. ` +
+                        `Waiting ${Math.round(retryDelayMs / 1000)}s before attempt ${attempt + 2} of ${maxRetries + 1}. ` +
                         'If this recurs, lower rate-limit-per-minute to match the key.');
                 }
                 else {
@@ -38659,14 +38768,15 @@ class MonitorClient {
             }
             catch (caught) {
                 if (caught instanceof MonitorApiError) {
-                    if (!RETRYABLE_STATUS.has(caught.statusCode) || attempt === this.maxRetries)
+                    const retryable = caught.retryable ?? RETRYABLE_STATUS.has(caught.statusCode);
+                    if (!retryable || attempt === maxRetries)
                         throw caught;
                     lastError = caught;
                     continue;
                 }
                 // Network-level failure (reset socket, DNS, timeout): worth another attempt.
                 const error = caught instanceof Error ? caught : new Error(String(caught));
-                if (attempt === this.maxRetries)
+                if (attempt === maxRetries)
                     throw error;
                 this.logger.warning(`${options.method} ${safeUrl} failed: ${this.redact(error.message)} — retrying`);
                 lastError = error;
@@ -38676,6 +38786,13 @@ class MonitorClient {
     }
 }
 exports.MonitorClient = MonitorClient;
+/** `hasHeadroom` is undefined when VirusTotal did not report the figure — unknown is not healthy. */
+function describeQuota(label, used, allowed) {
+    if (typeof used !== 'number' || typeof allowed !== 'number' || allowed <= 0) {
+        return { hasHeadroom: undefined, text: `${label} unknown` };
+    }
+    return { hasHeadroom: used < allowed, text: `${label} ${used}/${allowed}` };
+}
 /**
  * Renders response headers for the debug log. Only ever called with *response* headers —
  * request headers carry the API key and must not reach the log.

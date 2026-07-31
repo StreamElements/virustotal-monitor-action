@@ -40,6 +40,13 @@ inputs:
     description: 'Monitor storage quota. Accepts bytes or human sizes (1GB, 1GiB). VirusTotal does not expose this via API.'
     required: false
     default: '1073741824'
+  quota-files:
+    description: |
+      Monitor's file-count limit. VirusTotal limits stored files as well as bytes and answers
+      QuotaExceededError for either, but does not expose the limit via the API. 0 (default)
+      leaves the dimension untracked, so only the byte ceiling can trigger a prune.
+    required: false
+    default: '0'
   high-watermark:
     description: 'Usage fraction (0.8) or percentage (80) at which pruning starts.'
     required: false
@@ -133,6 +140,10 @@ outputs:
     description: 'Monitor storage usage after pruning.'
   usage-ratio:
     description: 'Usage as a fraction of the quota after pruning.'
+  usage-files:
+    description: 'Number of files stored in Monitor after pruning.'
+  usage-files-ratio:
+    description: 'Files as a fraction of quota-files after pruning; 0 when quota-files is unset.'
   api-requests:
     description: 'Number of VirusTotal API requests this run made.'
 

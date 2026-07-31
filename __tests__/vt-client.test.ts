@@ -262,6 +262,94 @@ describe('uploads that get rate limited', () => {
     ])
   })
 
+  it('stops waiting when a QuotaExceededError is really Monitor storage', async () => {
+    // QuotaExceededError covers request quotas *and* running out of Monitor disk or files.
+    // Healthy request quotas mean waiting cannot help, so it fails with the real cause.
+    const { client, calls, slept } = uploader([
+      { statusCode: 429, payload: { error: { code: 'QuotaExceededError', message: 'quota exceeded' } } },
+      { statusCode: 429, payload: { error: { code: 'QuotaExceededError', message: 'quota exceeded' } } },
+      {
+        statusCode: 200,
+        payload: {
+          data: {
+            api_requests_daily: { used: 137, allowed: 500 },
+            api_requests_monthly: { used: 4021, allowed: 15500 }
+          }
+        }
+      }
+    ])
+
+    await expect(client.uploadFile({ localPath, remotePath: '/a/setup.exe', size: 9 })).rejects.toThrow(
+      /most likely Monitor storage.*out of disk space or out of files/s
+    )
+    // One full window waited (a genuine per-minute overage would have cleared), then it stops
+    // instead of burning the remaining three retries re-sending the file.
+    expect(slept).toEqual([60_000])
+    expect(calls[calls.length - 1].url).toContain('/overall_quotas')
+  })
+
+  it('reports the quota figures that led it to blame storage', async () => {
+    const { client } = uploader([
+      { statusCode: 429, payload: { error: { code: 'QuotaExceededError' } } },
+      { statusCode: 429, payload: { error: { code: 'QuotaExceededError' } } },
+      {
+        statusCode: 200,
+        payload: {
+          data: {
+            api_requests_daily: { used: 137, allowed: 500 },
+            api_requests_monthly: { used: 4021, allowed: 15500 }
+          }
+        }
+      }
+    ])
+
+    await expect(client.uploadFile({ localPath, remotePath: '/a/setup.exe', size: 9 })).rejects.toThrow(
+      /daily 137\/500, monthly 4021\/15500/
+    )
+  })
+
+  it('keeps waiting when the daily quota really is spent', async () => {
+    const { client, slept } = uploader([
+      { statusCode: 429, payload: { error: { code: 'QuotaExceededError' } } },
+      { statusCode: 429, payload: { error: { code: 'QuotaExceededError' } } },
+      {
+        statusCode: 200,
+        payload: {
+          data: {
+            api_requests_daily: { used: 500, allowed: 500 },
+            api_requests_monthly: { used: 4021, allowed: 15500 }
+          }
+        }
+      },
+      { statusCode: 200, payload: { data: { id: 'eventually' } } }
+    ])
+
+    await expect(client.uploadFile({ localPath, remotePath: '/a/setup.exe', size: 9 })).resolves.toBe('eventually')
+    expect(slept.length).toBeGreaterThan(1)
+  })
+
+  it('treats unreadable quotas as inconclusive and keeps retrying', async () => {
+    const { client } = uploader([
+      { statusCode: 429, payload: { error: { code: 'QuotaExceededError' } } },
+      { statusCode: 429, payload: { error: { code: 'QuotaExceededError' } } },
+      { statusCode: 403, payload: { error: { code: 'ForbiddenError', message: 'no quota access' } } },
+      { statusCode: 200, payload: { data: { id: 'eventually' } } }
+    ])
+
+    await expect(client.uploadFile({ localPath, remotePath: '/a/setup.exe', size: 9 })).resolves.toBe('eventually')
+  })
+
+  it('does not blame storage for a plain TooManyRequestsError', async () => {
+    // That code is unambiguously about request rate, so waiting is the right response.
+    const { client } = uploader([
+      { statusCode: 429, payload: { error: { code: 'TooManyRequestsError' } } },
+      { statusCode: 429, payload: { error: { code: 'TooManyRequestsError' } } },
+      { statusCode: 200, payload: { data: { id: 'eventually' } } }
+    ])
+
+    await expect(client.uploadFile({ localPath, remotePath: '/a/setup.exe', size: 9 })).resolves.toBe('eventually')
+  })
+
   it('leaves the upload URL alone when the API itself is plain http', async () => {
     // Only reachable in tests; a real api-url is https, where the upgrade above still applies.
     const transport = fakeTransport([
@@ -281,12 +369,15 @@ describe('uploads that get rate limited', () => {
   })
 
   it('gives up with the rate-limit error after exhausting retries', async () => {
+    // Every response is a 429, including the quota lookup, so the request quotas read as
+    // unhealthy and the run keeps treating this as rate limiting.
     const { client, slept } = uploader([{ statusCode: 429, payload: { error: { code: 'QuotaExceededError' } } }])
 
     await expect(client.uploadFile({ localPath, remotePath: '/a/setup.exe', size: 9 })).rejects.toThrow(
       /HTTP 429.*QuotaExceededError/
     )
-    // Four retries, each waiting a full window rather than a doubling millisecond delay.
+    // Four retries, each waiting a full window rather than a doubling millisecond delay. The
+    // diagnostic lookup adds none: it is issued with retries disabled.
     expect(slept).toEqual([60_000, 60_000, 60_000, 60_000])
   })
 })
@@ -651,7 +742,8 @@ describe('getApiQuotas', () => {
     await expect(client(requestFn).getApiQuotas()).resolves.toEqual({
       dailyUsed: 137,
       dailyAllowed: 500,
-      monthlyUsed: 4021
+      monthlyUsed: 4021,
+      monthlyAllowed: 15500
     })
     expect(calls[0].url).toBe('https://vt.test/api/v3/users/test-key/overall_quotas')
   })

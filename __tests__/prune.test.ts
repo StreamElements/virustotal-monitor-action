@@ -304,6 +304,52 @@ describe('runPrune', () => {
     expect(result.deleted.map(g => g.name)).toEqual(['20260101000001', '20260102000002'])
   })
 
+  it('triggers on the file ceiling even when bytes are nowhere near the limit', async () => {
+    // The exact production trap: a quota-bytes far above reality means the byte ratio never
+    // moves, so without a file dimension prune stays asleep while uploads fail with
+    // QuotaExceededError.
+    const { client, deleteItem } = fakeClient(itemsFor(VERSIONS))
+    const result = await runPrune(client, {
+      ...baseOptions,
+      quotaBytes: 100 * 1024 * 1024 * 1024, // 100 GiB — byte ratio ~0%
+      quotaFiles: 5, // but 5 files of 5 allowed
+      manifests: manifestsMentioning()
+    })
+
+    expect(result.ratioBefore).toBeLessThan(0.01)
+    expect(result.fileRatioBefore).toBe(1)
+    expect(result.triggered).toBe(true)
+    // Down to 60% of 5 files = 3, so two files (two versions) go.
+    expect(result.freedFiles).toBe(2)
+    expect(result.fileCountAfter).toBe(3)
+    expect(deleteItem).toHaveBeenCalledWith('file:20260101000001')
+  })
+
+  it('keeps deleting until both dimensions are under target', async () => {
+    const { client } = fakeClient(itemsFor(VERSIONS))
+    const result = await runPrune(client, {
+      ...baseOptions,
+      quotaFiles: 5,
+      manifests: manifestsMentioning()
+    })
+
+    // Bytes alone would stop after 2 versions (400 of 1000 B); files need 2 gone as well, so
+    // the binding constraint is whichever is worse — here they agree.
+    expect(result.freedBytes).toBe(400)
+    expect(result.freedFiles).toBe(2)
+    expect(result.fileRatioAfter).toBeCloseTo(0.6)
+  })
+
+  it('leaves the file dimension out entirely when quota-files is 0', async () => {
+    const { client } = fakeClient(itemsFor(VERSIONS.slice(0, 3)))
+    const result = await runPrune(client, { ...baseOptions, manifests: manifestsMentioning() })
+
+    expect(result.quotaFiles).toBe(0)
+    expect(result.fileRatioBefore).toBe(0)
+    expect(result.fileCountBefore).toBe(3)
+    expect(result.triggered).toBe(false)
+  })
+
   it('purges stray entries before touching any release', async () => {
     // 5 x 200 B of releases plus 100 B of junk = 1100 B; freeing 500 B gets under target.
     const items: MonitorItem[] = [

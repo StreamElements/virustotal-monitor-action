@@ -71,6 +71,13 @@ export interface PruneResult {
   quotaBytes: number
   ratioBefore: number
   ratioAfter: number
+  /** File-count dimension of the quota. `quotaFiles` is 0 when the limit is not configured. */
+  fileCountBefore: number
+  fileCountAfter: number
+  quotaFiles: number
+  fileRatioBefore: number
+  fileRatioAfter: number
+  freedFiles: number
   triggered: boolean
   dryRun: boolean
   deleted: PruneGroup[]

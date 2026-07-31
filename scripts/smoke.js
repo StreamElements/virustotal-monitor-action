@@ -270,6 +270,21 @@ async function main(port) {
   check('exit 0', run.exitCode === 0, run.exitCode)
   check('warned instead of failing', /::warning::/.test(run.stdout), run.stdout.slice(0, 300))
 
+  console.log('--- the file ceiling can trigger a prune on its own ---')
+  run = await runAction({
+    ...pruneInputs,
+    'quota-bytes': '100GiB', // byte ratio ~0%, as in a misconfigured production setup
+    'quota-files': '5',
+    'dry-run': 'true'
+  })
+  check('prune triggered', run.outputs['prune-triggered'] === 'true', run.outputs['prune-triggered'])
+  check(
+    'reported the file dimension',
+    /Monitor files: 5 of 5 \(100\.0%\)/.test(run.stdout),
+    run.stdout.slice(0, 400)
+  )
+  check('reported files remaining', run.outputs['usage-files'] === '3', run.outputs['usage-files'])
+
   console.log('--- prune reaches entries that do not follow the version convention ---')
   // A stray folder and a loose file occupy quota just like a release folder does.
   state.items.push(

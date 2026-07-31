@@ -123,6 +123,11 @@ describe('parseConfig', () => {
     expect(config.seedRateLimitFromApi).toBe(false)
   })
 
+  it('leaves the file quota untracked unless it is set', () => {
+    expect(parseConfig(reader(base)).quotaFiles).toBe(0)
+    expect(parseConfig(reader({ ...base, 'quota-files': '20000' })).quotaFiles).toBe(20000)
+  })
+
   it('defaults verbose off and accepts it being switched on', () => {
     expect(parseConfig(reader(base)).verbose).toBe(false)
     expect(parseConfig(reader({ ...base, verbose: 'true' })).verbose).toBe(true)
